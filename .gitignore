@@ -1,0 +1,11 @@
+/data/
+/kat-irc
+/config.json
+/persona.md
+/memory.md
+/oauth.json
+/host-id.json
+/history.json
+*.lock
+*.test
+coverage.out

@@ -43,6 +43,18 @@ type Config struct {
 		CooldownSeconds int      `json:"cooldown_seconds"`
 		MaxReplyLines   int      `json:"max_reply_lines"`
 		AllowedAccounts []string `json:"allowed_accounts"`
+		Reactions       struct {
+			// Enabled offers the "react" tool and handles incoming TAGMSG
+			// reactions (context only). Disabled unless explicitly turned on.
+			Enabled bool `json:"enabled"`
+			// Spontaneous allows a rate-limited reaction-only evaluation of
+			// ordinary, non-triggering messages.
+			Spontaneous bool `json:"spontaneous"`
+			// MinIntervalSeconds bounds the cost of spontaneous evaluations.
+			MinIntervalSeconds int `json:"min_interval_seconds"`
+			// MaxPerReply caps reactions emitted for one model answer.
+			MaxPerReply int `json:"max_per_reply"`
+		} `json:"reactions"`
 	} `json:"bot"`
 }
 
@@ -131,6 +143,23 @@ func loadConfig(path string) (Config, error) {
 	}
 	if (c.IRC.SASLUser == "") != (c.IRC.SASLPassword == "") {
 		return c, fmt.Errorf("set both sasl_user and sasl_password")
+	}
+	if c.Bot.Reactions.Spontaneous && !c.Bot.Reactions.Enabled {
+		return c, fmt.Errorf("reactions.spontaneous requires reactions.enabled")
+	}
+	if c.Bot.Reactions.Enabled {
+		if c.Bot.Reactions.MaxPerReply < 1 {
+			c.Bot.Reactions.MaxPerReply = 2
+		}
+		if c.Bot.Reactions.MaxPerReply > 5 {
+			return c, fmt.Errorf("reactions.max_per_reply must be 1..5")
+		}
+	}
+	if c.Bot.Reactions.MinIntervalSeconds < 0 {
+		return c, fmt.Errorf("reactions.min_interval_seconds must be nonnegative")
+	}
+	if c.Bot.Reactions.Spontaneous && c.Bot.Reactions.MinIntervalSeconds < 15 {
+		c.Bot.Reactions.MinIntervalSeconds = 180
 	}
 	return c, nil
 }

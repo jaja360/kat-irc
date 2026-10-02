@@ -139,11 +139,11 @@ Only supply material appropriate for the channels in which the bot runs.
 
 ```sh
 docker build -t kat-irc:local .
-# Ensure the directory is writable by UID/GID 10001 first.
+# Ensure the directory is writable by UID/GID 568 first.
 docker run --rm --name kat-irc -v "$PWD/data:/data" kat-irc:local
 ```
 
-The image runs as UID/GID 10001 and works with a read-only root filesystem. Mount
+The image runs as UID/GID 568 and works with a read-only root filesystem. Mount
 one writable volume at `/data`. It includes CA certificates, a shell and `tar`
 for `kubectl exec` / `kubectl cp`. Only source files enter the Docker build context.
 

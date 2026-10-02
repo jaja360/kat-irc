@@ -49,10 +49,10 @@ func TestHistory(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	h.add("#a", Message{"user", "one"})
-	h.add("#a", Message{"assistant", "two"})
-	h.add("#a", Message{"user", "three"})
-	h.add("#b", Message{"user", "private"})
+	h.add("#a", Message{Role: "user", Content: "one", MsgID: "m1"})
+	h.add("#a", Message{Role: "assistant", Content: "two"})
+	h.add("#a", Message{Role: "user", Content: "three", MsgID: "m3"})
+	h.add("#b", Message{Role: "user", Content: "private"})
 	if e = h.save(); e != nil {
 		t.Fatal(e)
 	}
@@ -63,6 +63,9 @@ func TestHistory(t *testing.T) {
 	if got := h.snapshot("#a"); len(got) != 2 || got[0].Content != "two" {
 		t.Fatal(got)
 	}
+	if !h.hasMsgID("#a", "m3") || h.hasMsgID("#a", "m1") || h.hasMsgID("#b", "m3") || h.hasMsgID("#a", "") {
+		t.Fatal("msgid lookup must be per channel and limited to kept messages")
+	}
 	if stat, e := os.Stat(path); e != nil || stat.Mode().Perm() != 0600 {
 		t.Fatal("history permissions")
 	}
@@ -71,12 +74,42 @@ func sse(text string) string {
 	b, _ := json.Marshal(map[string]string{"type": "response.output_text.delta", "delta": text})
 	return "data: " + string(b) + "\n\ndata: {\"type\":\"response.completed\"}\n\n"
 }
+
+// sseToolCall mimics a Responses API stream that emits text plus a completed
+// function_call item, as observed in the real API (item id lives under item.id).
+func sseToolCall(text, name, args, callID string) string {
+	txt, _ := json.Marshal(map[string]string{"type": "response.output_text.delta", "delta": text})
+	part, _ := json.Marshal(map[string]string{"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": args[:1]})
+	item, _ := json.Marshal(map[string]any{"type": "response.output_item.done", "output_index": 1, "item": map[string]string{
+		"type": "function_call", "id": "fc_1", "call_id": callID, "name": name, "arguments": args,
+	}})
+	return "data: " + string(txt) + "\n\ndata: " + string(part) + "\n\ndata: " + string(item) + "\n\ndata: {\"type\":\"response.completed\"}\n\n"
+}
 func TestSSE(t *testing.T) {
 	out, e := consumeSSE(strings.NewReader(sse("Hello 😏")))
-	if e != nil || out != "Hello 😏" {
+	if e != nil || out.Text != "Hello 😏" || len(out.Calls) != 0 {
 		t.Fatal(out, e)
 	}
-	for _, in := range []string{"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n", "data: {\"type\":\"response.failed\"}\n\n", "data: {\"type\":\"response.incomplete\"}\n\n", "data: bad\n\n", "data: {\"type\":\"response.completed\"}\n\n"} {
+	calls, e := consumeSSE(strings.NewReader(sseToolCall("Hi", reactToolName, `{"emoji":"😏","msgid":"abc"}`, "call_1")))
+	if e != nil || calls.Text != "Hi" || len(calls.Calls) != 1 {
+		t.Fatal(calls, e)
+	}
+	got := calls.Calls[0]
+	if got.Name != reactToolName || got.CallID != "call_1" || got.Arguments != `{"emoji":"😏","msgid":"abc"}` {
+		t.Fatal(got)
+	}
+	// A call-only stream is valid: the bot reacts without sending text.
+	only, e := consumeSSE(strings.NewReader(sseToolCall("", reactToolName, `{"emoji":"🔥","msgid":"abc"}`, "call_2")))
+	if e != nil || only.Text != "" || len(only.Calls) != 1 {
+		t.Fatal(only, e)
+	}
+	// An empty completed stream is not a transport error; reply() decides
+	// whether an empty answer is acceptable (spontaneous turns are).
+	empty, e := consumeSSE(strings.NewReader("data: {\"type\":\"response.completed\"}\n\n"))
+	if e != nil || empty.Text != "" || len(empty.Calls) != 0 {
+		t.Fatal(empty, e)
+	}
+	for _, in := range []string{"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n", "data: {\"type\":\"response.failed\"}\n\n", "data: {\"type\":\"response.incomplete\"}\n\n", "data: bad\n\n"} {
 		if _, e := consumeSSE(strings.NewReader(in)); e == nil {
 			t.Fatal("accepted incomplete stream", in)
 		}
@@ -85,40 +118,61 @@ func TestSSE(t *testing.T) {
 func TestOpenAIRequest(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	for _, mode := range []string{"api_key", "chatgpt"} {
-		t.Run(mode, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/responses" || r.Header.Get("Authorization") != "Bearer test-key" {
-					t.Error("incorrect endpoint/auth")
+		for _, reactions := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/reactions=%v", mode, reactions), func(t *testing.T) {
+				var wantTools bool
+				var instructions string
+				var input []byte
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path != "/responses" || r.Header.Get("Authorization") != "Bearer test-key" {
+						t.Error("incorrect endpoint/auth")
+					}
+					var body map[string]any
+					if e := json.NewDecoder(r.Body).Decode(&body); e != nil {
+						t.Error(e)
+					}
+					if body["store"] != false || body["stream"] != true {
+						t.Error(body)
+					}
+					if _, ok := body["tools"]; ok != wantTools {
+						t.Error("wrong tools payload for reaction setting")
+					}
+					instructions, _ = body["instructions"].(string)
+					input, _ = json.Marshal(body["input"])
+					_, hasMax := body["max_output_tokens"]
+					if hasMax != (mode == "api_key") {
+						t.Error("wrong max_output_tokens for auth mode")
+					}
+					fmt.Fprint(w, sseToolCall("Test", reactToolName, `{"emoji":"😏","msgid":"resp1"}`, "call_1"))
+				}))
+				defer server.Close()
+				var c Config
+				c.OpenAI.Auth = mode
+				c.OpenAI.APIKey = "test-key"
+				c.OpenAI.CredentialsFile = filepath.Join(t.TempDir(), "oauth.json")
+				if e := atomicJSON(c.OpenAI.CredentialsFile, &Credentials{ClientID: "issued", Subject: "test", Scope: planScope, AccessToken: "test-key", ExpiresAt: time.Now().Add(time.Hour)}); e != nil {
+					t.Fatal(e)
 				}
-				var body map[string]any
-				if e := json.NewDecoder(r.Body).Decode(&body); e != nil {
-					t.Error(e)
+				c.OpenAI.Model = "test"
+				c.OpenAI.MaxOutputTokens = 100
+				c.Bot.Persona = "test"
+				c.Bot.Reactions.Enabled = reactions
+				c.Bot.Reactions.MaxPerReply = 2
+				wantTools = reactions
+				a := &AI{cfg: c, http: server.Client(), endpoint: server.URL}
+				msgs := []Message{{Role: "user", Content: "hello", MsgID: "req1"}}
+				out, e := a.reply(context.Background(), msgs, replyOptions{})
+				if e != nil || out.Text != "Test" || len(out.Calls) != 1 {
+					t.Fatal(out, e)
 				}
-				if body["store"] != false || body["stream"] != true {
-					t.Error(body)
+				if !strings.Contains(string(input), "[msgid:req1] hello") {
+					t.Error("msgid not exposed to the model", string(input))
 				}
-				_, hasMax := body["max_output_tokens"]
-				if hasMax != (mode == "api_key") {
-					t.Error("wrong max_output_tokens for auth mode")
+				if reactions != strings.Contains(instructions, reactToolName) {
+					t.Error("instructions must advertise the react tool when enabled", instructions)
 				}
-				fmt.Fprint(w, sse("Test"))
-			}))
-			defer server.Close()
-			var c Config
-			c.OpenAI.Auth = mode
-			c.OpenAI.APIKey = "test-key"
-			c.OpenAI.CredentialsFile = filepath.Join(t.TempDir(), "oauth.json")
-			if e := atomicJSON(c.OpenAI.CredentialsFile, &Credentials{ClientID: "issued", Subject: "test", Scope: planScope, AccessToken: "test-key", ExpiresAt: time.Now().Add(time.Hour)}); e != nil {
-				t.Fatal(e)
-			}
-			c.OpenAI.Model = "test"
-			c.OpenAI.MaxOutputTokens = 100
-			c.Bot.Persona = "test"
-			a := &AI{cfg: c, http: server.Client(), endpoint: server.URL}
-			if out, e := a.reply(context.Background(), []Message{{"user", "hello"}}); e != nil || out != "Test" {
-				t.Fatal(out, e)
-			}
-		})
+			})
+		}
 	}
 }
 
@@ -206,6 +260,7 @@ func TestIRCIntegration(t *testing.T) {
 	c.IRC.Port = listener.Addr().(*net.TCPAddr).Port
 	c.Bot.HistoryFile = ""
 	c.Bot.AllowedAccounts = []string{"alice"}
+	c.Bot.Reactions.Enabled = false // this test asserts exactly one API call
 	a := &AI{cfg: c, http: api.Client(), endpoint: api.URL}
 	h, _ := newHistory("", 40)
 	b := &Bot{cfg: c, ai: a, history: h}
@@ -271,6 +326,263 @@ func TestIRCIntegration(t *testing.T) {
 	got := until("PRIVMSG #chat :")
 	if !strings.Contains(got, "The test is alive") {
 		t.Fatal(got)
+	}
+	if calls.Load() != 1 {
+		t.Fatal("wrong number of API calls", calls.Load())
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown stuck")
+	}
+}
+
+func TestLogNote(t *testing.T) {
+	got := logNote("line1\nline2\x01 " + strings.Repeat("é", 500))
+	if strings.ContainsAny(got, "\n\x01") {
+		t.Fatal(got)
+	}
+	if n := utf8.RuneCountInString(got); n > 201 {
+		t.Fatal("unbounded log note", n)
+	}
+}
+
+func TestSpontaneousThrottle(t *testing.T) {
+	// Ordinary messages must not accumulate inference: at most one reaction-only
+	// evaluation per interval, and no IRC output when the model stays silent.
+	listener, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer listener.Close()
+	var calls atomic.Int32
+	checked := make(chan struct{}, 4)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var body map[string]any
+		if e := json.NewDecoder(r.Body).Decode(&body); e != nil {
+			t.Error(e)
+		}
+		if s, _ := body["instructions"].(string); !strings.Contains(s, "silent reaction check") {
+			t.Error("spontaneous turn must use the silent instructions")
+		}
+		fmt.Fprint(w, sse("Nothing here deserves a reaction."))
+		checked <- struct{}{}
+	}))
+	defer api.Close()
+	t.Setenv("OPENAI_API_KEY", "test")
+	c, e := loadConfig("config.example.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	c.OpenAI.Auth = "api_key"
+	c.IRC.TLS = false
+	c.IRC.Server = "127.0.0.1"
+	c.IRC.Port = listener.Addr().(*net.TCPAddr).Port
+	c.Bot.HistoryFile = ""
+	c.Bot.Reactions.Enabled = true
+	c.Bot.Reactions.Spontaneous = true
+	c.Bot.Reactions.MinIntervalSeconds = 600
+	c.Bot.Reactions.MaxPerReply = 2
+	a := &AI{cfg: c, http: api.Client(), endpoint: api.URL}
+	h, _ := newHistory("", 40)
+	b := &Bot{cfg: c, ai: a, history: h}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- b.run(ctx) }()
+	conn, e := listener.Accept()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
+	scan := bufio.NewScanner(conn)
+	send := func(s string) {
+		t.Helper()
+		if _, e := fmt.Fprint(conn, s+"\r\n"); e != nil {
+			t.Fatal(e)
+		}
+	}
+	until := func(sub string) string {
+		t.Helper()
+		for scan.Scan() {
+			l := scan.Text()
+			if strings.Contains(l, sub) {
+				return l
+			}
+		}
+		t.Fatalf("missing %q: %v", sub, scan.Err())
+		return ""
+	}
+	until("CAP LS")
+	send(":server CAP * LS :message-tags server-time account-tag batch")
+	req := until("CAP REQ :")
+	send(":server CAP Kat ACK :" + strings.TrimPrefix(req, "CAP REQ :"))
+	until("CAP END")
+	send(":server 001 Kat :Welcome")
+	send(":server 005 Kat CHANTYPES=# CASEMAPPING=ascii :supported")
+	send(":server 376 Kat :End MOTD")
+	until("JOIN #chat")
+	send(":Kat!kat@localhost JOIN #chat")
+	send(":server 353 Kat = #chat :Kat Alice")
+	send(":server 366 Kat #chat :End NAMES")
+	send("PING :joined")
+	until("PONG")
+	if !b.ready.Load() {
+		t.Fatal("not ready after JOIN")
+	}
+	for _, m := range []string{"first", "second", "third"} {
+		send("@account=alice;msgid=" + m + " :Alice!u@h PRIVMSG #chat :" + m)
+	}
+	select {
+	case <-checked:
+	case <-time.After(8 * time.Second):
+		t.Fatal("no spontaneous check")
+	}
+	send("PING :quiet")
+	if got := until("PONG"); !strings.HasPrefix(got, "PONG") {
+		t.Fatal(got)
+	}
+	// A silent decision must produce no PRIVMSG and no TAGMSG.
+	conn.SetReadDeadline(time.Now().Add(700 * time.Millisecond))
+	if scan.Scan() {
+		t.Fatalf("unexpected IRC output: %q", scan.Text())
+	}
+	if calls.Load() != 1 {
+		t.Fatal("throttle failed", calls.Load())
+	}
+	if got := b.history.snapshot("#chat"); len(got) != 3 {
+		t.Fatal("throttled messages must stay as context", len(got))
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown stuck")
+	}
+}
+
+func TestIRCReactions(t *testing.T) {
+	// The bot must see IRCv3 reactions and be able to send one back, including
+	// as a tool call targeting an older message identified by its msgid.
+	listener, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer listener.Close()
+	var calls atomic.Int32
+	var toolsSeen atomic.Bool
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var body map[string]any
+		if e := json.NewDecoder(r.Body).Decode(&body); e != nil {
+			t.Error(e)
+		}
+		if _, ok := body["tools"]; ok {
+			toolsSeen.Store(true)
+		}
+		fmt.Fprint(w, sseToolCall("Sure", reactToolName, `{"emoji":"😏","msgid":"m-alice"}`, "call_1"))
+	}))
+	defer api.Close()
+	t.Setenv("OPENAI_API_KEY", "test")
+	c, e := loadConfig("config.example.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	c.OpenAI.Auth = "api_key"
+	c.IRC.TLS = false
+	c.IRC.Server = "127.0.0.1"
+	c.IRC.Port = listener.Addr().(*net.TCPAddr).Port
+	c.Bot.HistoryFile = ""
+	c.Bot.AllowedAccounts = []string{"alice"}
+	c.Bot.Reactions.Enabled = true
+	c.Bot.Reactions.Spontaneous = false
+	c.Bot.Reactions.MaxPerReply = 2
+	a := &AI{cfg: c, http: api.Client(), endpoint: api.URL}
+	h, _ := newHistory("", 40)
+	b := &Bot{cfg: c, ai: a, history: h}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- b.run(ctx) }()
+	conn, e := listener.Accept()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
+	scan := bufio.NewScanner(conn)
+	send := func(s string) {
+		t.Helper()
+		if _, e := fmt.Fprint(conn, s+"\r\n"); e != nil {
+			t.Fatal(e)
+		}
+	}
+	until := func(sub string) string {
+		t.Helper()
+		for scan.Scan() {
+			l := scan.Text()
+			if strings.Contains(l, sub) {
+				return l
+			}
+		}
+		t.Fatalf("missing %q: %v", sub, scan.Err())
+		return ""
+	}
+	waitFor := func(cond func() bool) bool {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if cond() {
+				return true
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return false
+	}
+	until("CAP LS")
+	send(":server CAP * LS :message-tags server-time account-tag batch")
+	req := until("CAP REQ :")
+	send(":server CAP Kat ACK :" + strings.TrimPrefix(req, "CAP REQ :"))
+	until("CAP END")
+	send(":server 001 Kat :Welcome")
+	send(":server 005 Kat CHANTYPES=# CASEMAPPING=ascii :supported")
+	send(":server 376 Kat :End MOTD")
+	until("JOIN #chat")
+	send(":Kat!kat@localhost JOIN #chat")
+	send(":server 353 Kat = #chat :Kat Alice")
+	send(":server 366 Kat #chat :End NAMES")
+	send("PING :joined")
+	until("PONG")
+	if !b.ready.Load() {
+		t.Fatal("not ready after JOIN")
+	}
+	// Incoming reaction: must become conversation context.
+	send("@account=alice;+draft/react=🔥;+draft/reply=m-bob :Alice!u@h TAGMSG #chat")
+	if !waitFor(func() bool {
+		for _, m := range b.history.snapshot("#chat") {
+			if strings.Contains(m.Content, "reacted 🔥 to msgid=m-bob") {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatal("incoming reaction not recorded", b.history.snapshot("#chat"))
+	}
+	// Two messages, then an explicit trigger; the model reacts to the first one.
+	send("@account=alice;msgid=m-alice :Alice!u@h PRIVMSG #chat :hello from alice")
+	send("@account=alice :Alice!u@h PRIVMSG #chat :@Kat react please")
+	got := until("TAGMSG #chat")
+	if !strings.Contains(got, "+draft/react=😏") || !strings.Contains(got, "+draft/reply=m-alice") {
+		t.Fatal("wrong reaction line", got)
+	}
+	if !strings.Contains(got, "@+draft/react=") {
+		t.Fatal("reaction must be a client-only tag", got)
+	}
+	until("PRIVMSG #chat")
+	if !toolsSeen.Load() {
+		t.Fatal("react tool not advertised to the API")
 	}
 	if calls.Load() != 1 {
 		t.Fatal("wrong number of API calls", calls.Load())

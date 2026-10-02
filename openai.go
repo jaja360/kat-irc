@@ -14,6 +14,44 @@ import (
 
 const apiBase = "https://api.openai.com/v1"
 
+// reactToolName is the Responses API function tool the model calls to add an
+// IRCv3 reaction (client-only tags +draft/react and +draft/reply) to a message.
+const reactToolName = "react"
+
+const reactInstructions = `You can react to messages with an emoji using the %q tool.
+
+Every message coming from IRC is prefixed with [msgid:<id>]. To react, call %q with
+"msgid" set to the exact id from that prefix (any message shown above, not only the
+most recent one) and "emoji" set to a single emoji.
+
+Rules:
+- Only use msgid values you actually saw in the conversation.
+- Never react to your own messages.
+- At most %d reaction(s) per answer, and only when it genuinely fits.
+- Reacting is optional: if nothing is worth a reaction, do not call the tool.
+- The reason is a private one-sentence note; it is never sent to IRC.`
+
+const spontaneousOnlyInstructions = `This is a silent reaction check, not an invitation to chat: any text you produce is
+discarded and never sent to the channel, so do not write a chat reply.
+Call the %q tool only if a reaction is warranted. If nothing deserves a reaction, do
+not call the tool, and explain why in one short sentence (that note only appears in the
+bot's logs).`
+
+type ToolCall struct {
+	Name      string
+	CallID    string
+	Arguments string
+}
+type Reply struct {
+	Text  string
+	Calls []ToolCall
+}
+type replyOptions struct {
+	// spontaneous marks a "react or stay silent" evaluation: the model must
+	// not produce text, and an empty result is a normal outcome.
+	spontaneous bool
+}
+
 type AI struct {
 	cfg      Config
 	http     *http.Client
@@ -41,46 +79,133 @@ func (a *AI) token(ctx context.Context) (string, error) {
 	}
 	return oauthToken(ctx, a.cfg.OpenAI.CredentialsFile)
 }
-func (a *AI) reply(ctx context.Context, messages []Message) (string, error) {
+
+// instructions is the persona plus, when enabled, the reaction tool contract.
+func (a *AI) instructions(opts replyOptions) string {
+	s := a.cfg.Bot.Persona
+	if !a.cfg.Bot.Reactions.Enabled {
+		return s
+	}
+	max := a.cfg.Bot.Reactions.MaxPerReply
+	if max < 1 {
+		max = 1
+	}
+	s += "\n\n" + fmt.Sprintf(reactInstructions, reactToolName, reactToolName, max)
+	if opts.spontaneous {
+		s += "\n\n" + fmt.Sprintf(spontaneousOnlyInstructions, reactToolName)
+	}
+	return s
+}
+
+// wireInput exposes message ids to the model so it can react to any of the
+// preceding messages, not only the last one.
+func (a *AI) wireInput(messages []Message) []Message {
+	out := make([]Message, 0, len(messages))
+	for _, m := range messages {
+		if m.MsgID != "" && m.Role == "user" {
+			out = append(out, Message{Role: m.Role, Content: "[msgid:" + m.MsgID + "] " + m.Content})
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+func (a *AI) tools() []any {
+	return []any{map[string]any{
+		"type":        "function",
+		"name":        reactToolName,
+		"description": "Add an emoji reaction to one message of the conversation.",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"emoji":  map[string]any{"type": "string", "description": "A single emoji, e.g. \"\U0001F60F\"."},
+				"msgid":  map[string]any{"type": "string", "description": "The id shown in the [msgid:<id>] prefix of the target message."},
+				"reason": map[string]any{"type": "string", "description": "Short private justification (not sent to IRC)."},
+			},
+			"required":             []string{"emoji", "msgid"},
+			"additionalProperties": false,
+		},
+	}}
+}
+
+func (a *AI) reply(ctx context.Context, messages []Message, opts replyOptions) (Reply, error) {
 	token, e := a.token(ctx)
 	if e != nil {
-		return "", e
+		return Reply{}, e
 	}
-	body := map[string]any{"model": a.cfg.OpenAI.Model, "instructions": a.cfg.Bot.Persona, "input": messages, "store": false, "stream": true}
+	body := map[string]any{"model": a.cfg.OpenAI.Model, "instructions": a.instructions(opts), "input": a.wireInput(messages), "store": false, "stream": true}
 	if a.cfg.OpenAI.Auth == "api_key" {
 		body["max_output_tokens"] = a.cfg.OpenAI.MaxOutputTokens
 	}
 	if a.cfg.OpenAI.ReasoningEffort != "" {
 		body["reasoning"] = map[string]string{"effort": a.cfg.OpenAI.ReasoningEffort}
 	}
+	if a.cfg.Bot.Reactions.Enabled {
+		body["tools"] = a.tools()
+	}
 	b, e := json.Marshal(body)
 	if e != nil {
-		return "", e
+		return Reply{}, e
 	}
 	req, e := http.NewRequestWithContext(ctx, "POST", a.endpoint+"/responses", bytes.NewReader(b))
 	if e != nil {
-		return "", e
+		return Reply{}, e
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 	res, e := a.http.Do(req)
 	if e != nil {
-		return "", e
+		return Reply{}, e
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
-		return "", fmt.Errorf("OpenAI HTTP %d (check credentials, model and quota)", res.StatusCode)
+		return Reply{}, fmt.Errorf("OpenAI HTTP %d (check credentials, model and quota)", res.StatusCode)
 	}
-	return consumeSSE(io.LimitReader(res.Body, 8<<20))
+	rep, e := consumeSSE(io.LimitReader(res.Body, 8<<20))
+	if e != nil {
+		return Reply{}, e
+	}
+	// A silent spontaneous turn is a valid outcome; an empty answer is not.
+	if rep.Text == "" && len(rep.Calls) == 0 && !opts.spontaneous {
+		return Reply{}, fmt.Errorf("empty OpenAI response")
+	}
+	return rep, nil
 }
 
 // Only completed streams are published to IRC. No partial answer on quota/network failure.
-func consumeSSE(r io.Reader) (string, error) {
+func consumeSSE(r io.Reader) (Reply, error) {
 	s := bufio.NewScanner(r)
 	s.Buffer(make([]byte, 4096), 2<<20)
 	var text strings.Builder
 	var data []string
+
+	type call struct {
+		name   string
+		callID string
+		// final holds the complete arguments from the terminal item event;
+		// partial accumulates streaming deltas as a safety net.
+		final   string
+		partial strings.Builder
+	}
+	// Responses API events reference a function call either by item id
+	// (output_item.*) or by item_id (function_call_arguments.*), both of which
+	// carry the same value.
+	calls := map[string]*call{}
+	var order []string
+	get := func(key string) *call {
+		if key == "" {
+			key = "?"
+		}
+		c, ok := calls[key]
+		if !ok {
+			c = &call{}
+			calls[key] = c
+			order = append(order, key)
+		}
+		return c
+	}
+
 	process := func() (bool, error) {
 		if len(data) == 0 {
 			return false, nil
@@ -91,8 +216,17 @@ func consumeSSE(r io.Reader) (string, error) {
 			return false, nil
 		}
 		var ev struct {
-			Type  string `json:"type"`
-			Delta string `json:"delta"`
+			Type      string `json:"type"`
+			Delta     string `json:"delta"`
+			ItemID    string `json:"item_id"`
+			Arguments string `json:"arguments"`
+			Item      *struct {
+				Type      string `json:"type"`
+				ID        string `json:"id"`
+				CallID    string `json:"call_id"`
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			} `json:"item"`
 		}
 		if e := json.Unmarshal([]byte(b), &ev); e != nil {
 			return false, fmt.Errorf("invalid OpenAI stream")
@@ -103,6 +237,34 @@ func consumeSSE(r io.Reader) (string, error) {
 			if text.Len() > 128000 {
 				return false, fmt.Errorf("response exceeds local size limit")
 			}
+		case "response.output_item.added", "response.output_item.done":
+			if ev.Item == nil || ev.Item.Type != "function_call" {
+				break
+			}
+			key := ev.Item.ID
+			if key == "" {
+				key = ev.Item.CallID
+			}
+			c := get(key)
+			if c.name == "" {
+				c.name = ev.Item.Name
+			}
+			if c.callID == "" {
+				c.callID = ev.Item.CallID
+			}
+			if ev.Type == "response.output_item.done" && ev.Item.Arguments != "" {
+				c.final = ev.Item.Arguments
+			}
+		case "response.function_call_arguments.delta":
+			c := get(ev.ItemID)
+			c.partial.WriteString(ev.Delta)
+			if c.partial.Len() > 16<<10 {
+				return false, fmt.Errorf("tool call arguments too large")
+			}
+		case "response.function_call_arguments.done":
+			c := get(ev.ItemID)
+			c.partial.Reset()
+			c.final = ev.Arguments
 		case "response.completed":
 			return true, nil
 		case "response.failed", "response.incomplete", "error":
@@ -115,12 +277,20 @@ func consumeSSE(r io.Reader) (string, error) {
 		if line == "" {
 			done, e := process()
 			if e != nil {
-				return "", e
+				return Reply{}, e
 			}
 			if done {
-				out := strings.TrimSpace(text.String())
-				if out == "" {
-					return "", fmt.Errorf("empty OpenAI response")
+				out := Reply{Text: strings.TrimSpace(text.String())}
+				for _, key := range order {
+					c := calls[key]
+					if c == nil || c.name == "" {
+						continue
+					}
+					args := c.final
+					if args == "" {
+						args = c.partial.String()
+					}
+					out.Calls = append(out.Calls, ToolCall{Name: c.name, CallID: c.callID, Arguments: args})
 				}
 				return out, nil
 			}
@@ -129,9 +299,9 @@ func consumeSSE(r io.Reader) (string, error) {
 		}
 	}
 	if e := s.Err(); e != nil {
-		return "", e
+		return Reply{}, e
 	}
-	return "", fmt.Errorf("OpenAI stream interrupted before response.completed")
+	return Reply{}, fmt.Errorf("OpenAI stream interrupted before response.completed")
 }
 func (a *AI) models(ctx context.Context) error {
 	token, e := a.token(ctx)

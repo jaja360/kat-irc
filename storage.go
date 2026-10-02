@@ -37,6 +37,9 @@ func atomicJSON(path string, v any) error {
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// MsgID is the IRCv3 msgid of the message, when the server provides one.
+	// It lets the model target a specific (possibly older) message to react to.
+	MsgID string `json:"msgid,omitempty"`
 }
 type History struct {
 	mu       sync.Mutex
@@ -81,6 +84,22 @@ func (h *History) snapshot(ch string) []Message {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]Message(nil), h.channels[ch]...)
+}
+
+// hasMsgID reports whether id belongs to a message currently kept for ch. It
+// guards against the model inventing or reusing a msgid from another channel.
+func (h *History) hasMsgID(ch, id string) bool {
+	if id == "" {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, m := range h.channels[ch] {
+		if m.MsgID == id {
+			return true
+		}
+	}
+	return false
 }
 func (h *History) save() error {
 	h.mu.Lock()

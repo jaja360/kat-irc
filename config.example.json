@@ -29,6 +29,12 @@
     "history_file": "history.json",
     "cooldown_seconds": 3,
     "max_reply_lines": 6,
-    "allowed_accounts": []
+    "allowed_accounts": [],
+    "reactions": {
+      "enabled": true,
+      "spontaneous": true,
+      "min_interval_seconds": 180,
+      "max_per_reply": 2
+    }
   }
 }

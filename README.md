@@ -16,6 +16,19 @@ MIT licensed. No personal profile or deployment-specific configuration is bundle
   become context; only addressed messages cause inference. `allowed_accounts`
   restricts inference to authenticated IRC accounts, not nicknames. It does not
   exclude other participants' messages from context.
+- Sees IRCv3 reactions: incoming `TAGMSG` with `+draft/react`/`+draft/reply` is
+  recorded as context, so the bot knows who reacted to which message.
+- Can react back with emoji. When `reactions.enabled` is set, the model gets a
+  `react` tool and may attach `+draft/react` + `+draft/reply` client-only tags to
+  any message it saw in the conversation, not only the latest one. Message ids are
+  exposed to the model as a `[msgid:…]` prefix; ids that were not actually seen in
+  that channel are dropped, so a hallucinated target never becomes a stray TAGMSG.
+  A reaction-only answer sends no chat text.
+- Reacts spontaneously when `reactions.spontaneous` is set: ordinary,
+  non-triggering messages get a reaction-only evaluation at most once every
+  `reactions.min_interval_seconds`, and never while a real answer is in flight.
+  This bounds the extra inference cost; the model decides whether a reaction is
+  warranted and may do nothing.
 - Makes one inference request at a time, with a cooldown and timeout. IRC PING
   handling remains active while inference runs. Replies are sanitized and split
   into bounded UTF-8 lines. Failed/incomplete streams are not posted as answers.
@@ -118,6 +131,35 @@ resolve beside the configuration file. The container reads `/data/config.json`.
 | `bot.history_messages`, `bot.history_file` | 1–200 recent messages per channel; empty path disables persistence |
 | `bot.cooldown_seconds`, `bot.max_reply_lines` | Minimum interval between requests and 1–20 output lines |
 | `bot.allowed_accounts` | Optional IRC account allowlist; empty allows everyone in configured channels |
+| `bot.reactions.enabled` | Offer the `react` tool, handle incoming reactions; off unless set |
+| `bot.reactions.spontaneous` | Also evaluate ordinary messages for a reaction; requires `enabled` |
+| `bot.reactions.min_interval_seconds` | Minimum gap between spontaneous evaluations (default 180, minimum 15) |
+| `bot.reactions.max_per_reply` | Reactions emitted per model answer, 1–5 (default 2) |
+
+### Reactions
+
+Reactions are IRCv3 client-only tags: the bot sends
+`@+draft/react=<emoji>;+draft/reply=<msgid> TAGMSG <channel>` and reads the same
+tags on incoming `TAGMSG`. Requirements and caveats:
+
+- The IRC server must relay client-only tags and message ids, and the bot must
+  negotiate `message-tags` (it does by default). Ergo does this; soju relays
+  client-only tags too. Servers without it will simply deliver no reactions, and
+  the bot logs that it cannot react rather than failing.
+- Reactions target a message id, so the target message must still be inside the
+  per-channel history window (`bot.history_messages`). Reacting to something
+  further back is not possible.
+- `bot.reactions.spontaneous` adds one extra inference per interval, even when the
+  result is "no reaction". Raise `min_interval_seconds` to cut cost, or leave
+  `spontaneous` false to react only alongside triggered answers.
+- Each reaction the bot sends is appended to the conversation history, which keeps
+  it from reacting twice to the same message.
+- Logs: every sent reaction logs the model's `reason`, and every spontaneous check
+  logs its outcome explicitly, including `reactions=0` with the model's one-sentence
+  note. Both are logs only: the note is never sent to IRC and never stored in
+  `history.json`. Inspect with
+  `kubectl -n kat-irc logs deploy/<deployment> | grep -E 'reacted|reaction check'`.
+  As a consequence, the pod log contains short paraphrases of channel content.
 
 The sample selects `gpt-6-luna` with low reasoning effort as a starting point for
 short conversational replies. Confirm availability using `models` in OAuth mode;
@@ -190,8 +232,9 @@ go build ./...
 
 Tests use a local TCP IRC server and HTTP mocks: negotiation, trigger/account/replay
 filtering, PING during inference, output sanitation, history isolation, setup
-waiting, health states and serialized OAuth refresh. They do not exercise a real
-OpenAI account or a Kubernetes cluster.
+waiting, health states, serialized OAuth refresh, SSE function-call parsing,
+reaction send/receive, spontaneous throttling and log-note bounds. They do not
+exercise a real OpenAI account or a Kubernetes cluster.
 
 GitHub Actions tests and builds the container on PRs. On `main`, it publishes
 `ghcr.io/<owner>/<repository>:<VERSION>` and a commit SHA tag with `GITHUB_TOKEN`.

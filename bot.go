@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -31,6 +32,49 @@ func triggered(s, nick string) bool {
 	}
 	return false
 }
+
+// validReaction accepts a short, single-token emoji suitable for an IRCv3 tag.
+func validReaction(s string) bool {
+	if s == "" || len(s) > 32 || !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// escapeTagValue applies IRCv3 message-tag value escaping; CR/LF are dropped.
+func escapeTagValue(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case ';':
+			b.WriteString(`\:`)
+		case ' ':
+			b.WriteString(`\s`)
+		case '\r', '\n':
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// logNote returns a single-line, bounded form of model commentary for logs.
+// It is never sent to IRC or kept in the conversation history.
+func logNote(s string) string {
+	s = strings.Join(strings.Fields(clean(s)), " ")
+	if r := []rune(s); len(r) > 200 {
+		s = string(r[:200]) + "…"
+	}
+	return s
+}
+
 func clean(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\r' || r == '\t' {
@@ -66,14 +110,26 @@ func replyLines(s string, limit int) []string {
 }
 
 type Bot struct {
-	cfg      Config
-	ai       *AI
-	history  *History
-	ready    atomic.Bool
-	busy     atomic.Bool
-	mu       sync.Mutex
-	last     time.Time
-	requests sync.WaitGroup
+	cfg       Config
+	ai        *AI
+	history   *History
+	ready     atomic.Bool
+	busy      atomic.Bool
+	reacting  atomic.Bool
+	mu        sync.Mutex
+	last      time.Time
+	lastReact time.Time
+	requests  sync.WaitGroup
+}
+
+// allowedChannel returns the canonical watched channel for target, or "".
+func (b *Bot) allowedChannel(target string) string {
+	for _, allowed := range b.cfg.IRC.Channels {
+		if girc.ToRFC1459(allowed) == girc.ToRFC1459(target) {
+			return girc.ToRFC1459(allowed)
+		}
+	}
+	return ""
 }
 
 func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started time.Time) {
@@ -92,13 +148,7 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 			return
 		}
 	}
-	ch := ""
-	for _, allowed := range b.cfg.IRC.Channels {
-		if girc.ToRFC1459(allowed) == girc.ToRFC1459(e.Params[0]) {
-			ch = girc.ToRFC1459(allowed)
-			break
-		}
-	}
+	ch := b.allowedChannel(e.Params[0])
 	if ch == "" {
 		return
 	}
@@ -108,9 +158,11 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 	}
 	// Ordinary conversation is context, but only an explicit prefix causes inference.
 	account, _ := e.Tags.Get("account")
+	msgid, _ := e.Tags.Get("msgid")
 	content := fmt.Sprintf("IRC nick=%s account=%s: %s", e.Source.Name, account, clean(msg))
-	b.history.add(ch, Message{Role: "user", Content: content})
+	b.history.add(ch, Message{Role: "user", Content: content, MsgID: msgid})
 	if !triggered(msg, b.cfg.IRC.Nick) {
+		b.maybeReact(ctx, c, ch)
 		return
 	}
 	if len(b.cfg.Bot.AllowedAccounts) > 0 {
@@ -139,7 +191,7 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 		defer b.busy.Store(false)
 		reqCtx, cancel := context.WithTimeout(ctx, time.Duration(b.cfg.OpenAI.TimeoutSeconds)*time.Second)
 		defer cancel()
-		answer, err := b.ai.reply(reqCtx, snapshot)
+		rep, err := b.ai.reply(reqCtx, snapshot, replyOptions{})
 		if ctx.Err() != nil || !c.IsConnected() || !c.IsInChannel(ch) {
 			return
 		}
@@ -148,7 +200,12 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 			c.Cmd.Message(ch, "Unable to answer: service unavailable or usage limit reached. Check the bot logs.")
 			return
 		}
-		lines := replyLines(answer, b.cfg.Bot.MaxReplyLines)
+		// Reactions apply even when the model produced no text (react-only answer).
+		b.applyReactions(c, ch, rep.Calls)
+		lines := replyLines(rep.Text, b.cfg.Bot.MaxReplyLines)
+		if len(lines) == 0 {
+			return
+		}
 		for i, line := range lines {
 			if i > 0 {
 				select {
@@ -165,6 +222,127 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 		b.history.add(ch, Message{Role: "assistant", Content: strings.Join(lines, "\n")})
 	}()
 }
+
+// applyReactions validates model tool calls and emits IRCv3 reactions. Only
+// msgids already seen in this channel are accepted, so a hallucinated target is
+// dropped instead of becoming a stray TAGMSG. It returns the number of reactions
+// actually sent.
+func (b *Bot) applyReactions(c *girc.Client, ch string, calls []ToolCall) int {
+	if len(calls) == 0 || !b.cfg.Bot.Reactions.Enabled {
+		return 0
+	}
+	if !c.HasCapability("message-tags") {
+		slog.Warn("reactions unavailable: server did not negotiate message-tags")
+		return 0
+	}
+	max := b.cfg.Bot.Reactions.MaxPerReply
+	sent := 0
+	for _, call := range calls {
+		if sent >= max {
+			break
+		}
+		if call.Name != reactToolName {
+			continue
+		}
+		var args struct {
+			Emoji  string `json:"emoji"`
+			MsgID  string `json:"msgid"`
+			Reason string `json:"reason"`
+		}
+		if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
+			slog.Warn("ignoring malformed reaction arguments", "error", err)
+			continue
+		}
+		emoji := strings.TrimSpace(args.Emoji)
+		if !validReaction(emoji) {
+			slog.Warn("ignoring invalid reaction emoji", "emoji", args.Emoji)
+			continue
+		}
+		if !b.history.hasMsgID(ch, args.MsgID) {
+			slog.Warn("ignoring reaction to unknown msgid", "msgid", args.MsgID)
+			continue
+		}
+		raw := fmt.Sprintf("@+draft/react=%s;+draft/reply=%s TAGMSG %s", escapeTagValue(emoji), escapeTagValue(args.MsgID), ch)
+		if err := c.Cmd.SendRawNoSplit(raw); err != nil {
+			slog.Warn("sending reaction failed", "error", err)
+			continue
+		}
+		sent++
+		slog.Info("reacted", "channel", ch, "emoji", emoji, "msgid", args.MsgID, "reason", logNote(args.Reason))
+		// Remember the action so the model does not react to the same message twice.
+		b.history.add(ch, Message{Role: "assistant", Content: fmt.Sprintf("[reacted %s to msgid=%s]", emoji, args.MsgID)})
+	}
+	return sent
+}
+
+// maybeReact runs a rate-limited, reaction-only evaluation of an ordinary
+// message. It never produces chat text and never blocks a real answer.
+func (b *Bot) maybeReact(ctx context.Context, c *girc.Client, ch string) {
+	r := b.cfg.Bot.Reactions
+	if !r.Enabled || !r.Spontaneous || b.busy.Load() {
+		return
+	}
+	interval := time.Duration(r.MinIntervalSeconds) * time.Second
+	b.mu.Lock()
+	if time.Since(b.lastReact) < interval {
+		b.mu.Unlock()
+		return
+	}
+	b.lastReact = time.Now()
+	b.mu.Unlock()
+	if !b.reacting.CompareAndSwap(false, true) {
+		return
+	}
+	snapshot := b.history.snapshot(ch)
+	b.requests.Add(1)
+	go func() {
+		defer b.requests.Done()
+		defer b.reacting.Store(false)
+		reqCtx, cancel := context.WithTimeout(ctx, time.Duration(b.cfg.OpenAI.TimeoutSeconds)*time.Second)
+		defer cancel()
+		rep, err := b.ai.reply(reqCtx, snapshot, replyOptions{spontaneous: true})
+		if err != nil {
+			// A silent no-op is normal here; only real failures are worth a log.
+			slog.Warn("reaction check failed", "error", err)
+			return
+		}
+		if ctx.Err() != nil || !c.IsConnected() || !c.IsInChannel(ch) {
+			return
+		}
+		sent := b.applyReactions(c, ch, rep.Calls)
+		// Log-only: the model's private note is never sent to IRC, including when
+		// it decided that no reaction was warranted.
+		slog.Info("reaction check", "channel", ch, "reactions", sent, "note", logNote(rep.Text))
+	}()
+}
+
+// acceptTags records incoming IRCv3 reactions (+draft/react, +draft/reply) as
+// conversation context, so the bot can see who reacted to what.
+func (b *Bot) acceptTags(c *girc.Client, e girc.Event) {
+	if !b.ready.Load() || e.Source == nil || len(e.Params) != 1 || strings.EqualFold(e.Source.Name, c.GetNick()) {
+		return
+	}
+	if _, ok := e.Tags.Get("batch"); ok {
+		return
+	}
+	react, ok := e.Tags.Get("+draft/react")
+	if !ok {
+		return
+	}
+	react = clean(react)
+	if len(react) > 32 {
+		return
+	}
+	ch := b.allowedChannel(e.Params[0])
+	if ch == "" {
+		return
+	}
+	replyTo, _ := e.Tags.Get("+draft/reply")
+	account, _ := e.Tags.Get("account")
+	b.history.add(ch, Message{Role: "user", Content: fmt.Sprintf("IRC nick=%s account=%s: reacted %s to msgid=%s", e.Source.Name, account, react, replyTo)})
+	slog.Info("reaction received", "channel", ch, "nick", e.Source.Name, "emoji", react, "msgid", replyTo)
+}
+
 func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 	tc := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: b.cfg.IRC.ServerName}
 	if b.cfg.IRC.CAFile != "" {
@@ -181,7 +359,7 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 		}
 		tc.RootCAs = roots
 	}
-	cfg := girc.Config{Server: b.cfg.IRC.Server, Port: b.cfg.IRC.Port, Nick: b.cfg.IRC.Nick, User: "kat", Name: "Configurable IRC assistant", SSL: b.cfg.IRC.TLS, TLSConfig: tc, DisableSTS: true, ServerPass: b.cfg.IRC.Password, Version: "kat-irc 0.1.0", HandleNickCollide: func(string) string { return "" }}
+	cfg := girc.Config{Server: b.cfg.IRC.Server, Port: b.cfg.IRC.Port, Nick: b.cfg.IRC.Nick, User: "kat", Name: "Configurable IRC assistant", SSL: b.cfg.IRC.TLS, TLSConfig: tc, DisableSTS: true, ServerPass: b.cfg.IRC.Password, Version: "kat-irc 0.2.0", HandleNickCollide: func(string) string { return "" }}
 	if b.cfg.IRC.SASLUser != "" {
 		cfg.SASL = &girc.SASLPlain{User: b.cfg.IRC.SASLUser, Pass: b.cfg.IRC.SASLPassword}
 	}
@@ -243,6 +421,7 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 		}
 	})
 	c.Handlers.Add(girc.PRIVMSG, func(c *girc.Client, e girc.Event) { b.accept(ctx, c, e, started) })
+	c.Handlers.Add("TAGMSG", func(c *girc.Client, e girc.Event) { b.acceptTags(c, e) })
 	for _, numeric := range []string{"433", "432", "471", "473", "474", "475", "476", "477", "489", "904", "905", "906"} {
 		c.Handlers.Add(numeric, func(c *girc.Client, e girc.Event) {
 			slog.Error("IRC registration/join failed", "numeric", e.Command)

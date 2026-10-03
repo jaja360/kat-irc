@@ -823,6 +823,29 @@ func TestIRCPresence(t *testing.T) {
 	}
 }
 
+func TestConfigUserValidation(t *testing.T) {
+	raw, e := os.ReadFile("config.example.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	var m map[string]any
+	if e := json.Unmarshal(raw, &m); e != nil {
+		t.Fatal(e)
+	}
+	m["irc"].(map[string]any)["user"] = "kat/ergo"
+	out, e := json.Marshal(m)
+	if e != nil {
+		t.Fatal(e)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if e := os.WriteFile(path, out, 0600); e != nil {
+		t.Fatal(e)
+	}
+	if _, err := loadConfig(path); err == nil {
+		t.Fatal("invalid irc.user must be rejected")
+	}
+}
+
 func TestImageConfig(t *testing.T) {
 	load := func(t *testing.T, images any) (Config, error) {
 		t.Helper()
@@ -1026,6 +1049,91 @@ func TestMemberList(t *testing.T) {
 	m.clear("#a")
 	if got := m.summary("#a", "Kat"); len(got) != 0 {
 		t.Fatal("clear", got)
+	}
+}
+
+func TestIRCSASLNotRepeated(t *testing.T) {
+	// girc re-sends AUTHENTICATE on any later CAP ACK, which soju triggers via
+	// CAP NEW (cap-notify). The bot must complete SASL once and not re-auth.
+	listener, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer listener.Close()
+	t.Setenv("OPENAI_API_KEY", "test")
+	c, e := loadConfig("config.example.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	c.IRC.TLS = false
+	c.IRC.Server = "127.0.0.1"
+	c.IRC.Port = listener.Addr().(*net.TCPAddr).Port
+	c.IRC.SASLUser = "kat/ergo"
+	c.IRC.SASLPassword = "secret"
+	c.Bot.HistoryFile = ""
+	a := &AI{cfg: c, http: &http.Client{}}
+	h, _ := newHistory("", 40)
+	b := &Bot{cfg: c, ai: a, history: h}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- b.run(ctx) }()
+	conn, e := listener.Accept()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
+	scan := bufio.NewScanner(conn)
+	send := func(s string) {
+		t.Helper()
+		if _, e := fmt.Fprint(conn, s+"\r\n"); e != nil {
+			t.Fatal(e)
+		}
+	}
+	until := func(sub string) string {
+		t.Helper()
+		for scan.Scan() {
+			l := scan.Text()
+			if strings.Contains(l, sub) {
+				return l
+			}
+		}
+		t.Fatalf("missing %q: %v", sub, scan.Err())
+		return ""
+	}
+	until("CAP LS")
+	send(":server CAP * LS :sasl message-tags server-time account-tag batch")
+	req := until("CAP REQ :")
+	send(":server CAP Kat ACK :" + strings.TrimPrefix(req, "CAP REQ :"))
+	until("AUTHENTICATE PLAIN")
+	send("AUTHENTICATE +")
+	until("AUTHENTICATE ")
+	send(":server 903 Kat :SASL authentication successful")
+	until("CAP END")
+	send(":server 001 Kat :Welcome")
+	send(":server 005 Kat CHANTYPES=# CASEMAPPING=ascii :supported")
+	send(":server 376 Kat :End MOTD")
+	// soju connected upstream and announces new caps via cap-notify.
+	send(":server CAP Kat NEW account-notify")
+	newReq := until("CAP REQ ")
+	newCaps := strings.TrimPrefix(strings.TrimPrefix(newReq, "CAP REQ "), ":")
+	if !strings.Contains(newCaps, "account-notify") {
+		t.Fatal("expected CAP REQ for account-notify", newReq)
+	}
+	send(":server CAP Kat ACK :" + newCaps)
+	// A second AUTHENTICATE here is the reconnect-loop bug.
+	conn.SetReadDeadline(time.Now().Add(800 * time.Millisecond))
+	for scan.Scan() {
+		if strings.Contains(scan.Text(), "AUTHENTICATE") {
+			t.Fatalf("client re-authenticated after CAP NEW: %q", scan.Text())
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown stuck")
 	}
 }
 

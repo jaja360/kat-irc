@@ -137,6 +137,9 @@ func loadConfig(path string) (Config, error) {
 	if c.IRC.User == "" {
 		c.IRC.User = "kat"
 	}
+	if !girc.IsValidUser(c.IRC.User) {
+		return c, fmt.Errorf("irc.user must be a valid IRC ident")
+	}
 	if c.Bot.HistoryMessages < 1 || c.Bot.HistoryMessages > 200 {
 		return c, fmt.Errorf("history_messages must be 1..200")
 	}

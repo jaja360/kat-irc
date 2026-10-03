@@ -668,7 +668,14 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 		}
 	}
 	started := time.Now()
-	c.Handlers.Add("903", func(_ *girc.Client, _ girc.Event) { saslOK.Store(true) })
+	c.Handlers.Add("903", func(c *girc.Client, _ girc.Event) {
+		saslOK.Store(true)
+		// girc re-sends AUTHENTICATE on any later CAP ACK, which happens when
+		// soju sends CAP NEW (cap-notify). soju treats a post-registration
+		// AUTHENTICATE as upstream SASL and forwards our bouncer credentials,
+		// so tell girc that sasl is gone before that can happen.
+		c.RunHandlers(&girc.Event{Command: "CAP", Params: []string{"*", "DEL", "sasl"}})
+	})
 	c.Handlers.Add("005", func(_ *girc.Client, e girc.Event) {
 		// girc only parses ISUPPORT when its trailing parameter ends in
 		// "this server"; soju ends it in "are supported", so scan it ourselves.

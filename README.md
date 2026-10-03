@@ -144,7 +144,7 @@ resolve beside the configuration file. The container reads `/data/config.json`.
 | `irc.tls` | Enable certificate-verified TLS, minimum TLS 1.2 |
 | `irc.server_name`, `irc.ca_file` | Optional TLS name override and custom CA |
 | `irc.password` | Optional IRC server password; fallback `IRC_PASSWORD` |
-| `irc.user` | IRC username/ident (default `kat`); with soju PASS auth use `<soju-user>/<network>` |
+| `irc.user` | IRC username/ident (default `kat`); must be a valid ident (no `/` or `@`) |
 | `irc.sasl_user`, `irc.sasl_password` | SASL PLAIN credentials; password fallback `IRC_SASL_PASSWORD` |
 | `irc.allow_plaintext_auth` | Explicit opt-in to send IRC passwords without TLS |
 | `openai.auth` | Exactly `chatgpt` or `api_key` |
@@ -219,12 +219,12 @@ server's HTTP upload host, and posts the resulting URL. Requirements and caveats
   with HTTP Basic using `irc.sasl_user` / `irc.sasl_password` when set, otherwise
   `irc.user` / `irc.password`. On success the `Location` header is resolved against
   the upload URL and posted.
-- Through a soju bouncer, prefer **PASS auth over SASL**: set `irc.user` to
-  `<soju-user>/<network>` and `irc.password` to the soju password (with
-  `allow_plaintext_auth` when not using TLS), leaving `irc.sasl_*` empty. girc
-  re-sends `AUTHENTICATE` after soju's `CAP NEW` (cap-notify), which soju treats as
-  upstream SASL and forwards the bouncer username `<soju-user>/<network>` to the
-  network; PASS avoids that entirely.
+- Through a soju bouncer, use SASL PLAIN with `irc.sasl_user` set to
+  `<soju-user>/<network>` (soju selects the upstream network from the SASL
+  username). The bot suppresses girc's duplicate `AUTHENTICATE` after soju's
+  `CAP NEW` (cap-notify), which soju would otherwise treat as upstream SASL and
+  forward to the network, causing a reconnect loop. The file host's HTTP Basic
+  auth reuses the same credentials.
 - The upload host is discovered from the `soju.im/FILEHOST` (soju) or
   `draft/FILEHOST` (Ergo) ISUPPORT token, or set with `bot.images.filehost`, and
   the advertised value is logged at startup. If none is present the tool fails

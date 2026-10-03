@@ -229,7 +229,7 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 	content := fmt.Sprintf("IRC nick=%s account=%s: %s", e.Source.Name, account, clean(msg))
 	b.history.add(ch, Message{Role: "user", Content: content, MsgID: msgid})
 	if !triggered(msg, b.cfg.IRC.Nick) {
-		b.maybeReact(ctx, c, ch)
+		b.maybeReact(ctx, c, ch, msgid)
 		return
 	}
 	if len(b.cfg.Bot.AllowedAccounts) > 0 {
@@ -330,7 +330,7 @@ func (b *Bot) applyReactions(c *girc.Client, ch string, calls []ToolCall) int {
 		slog.Warn("reactions unavailable: server did not negotiate message-tags")
 		return 0
 	}
-	max := b.cfg.Bot.Reactions.MaxPerReply
+	max := maxReactionsPerTurn
 	sent := 0
 	seen := map[string]bool{}
 	for _, call := range calls {
@@ -569,11 +569,12 @@ func (b *Bot) ownSummary(ch string) string {
 	return strings.Join(parts, "\n")
 }
 
-// maybeReact runs a rate-limited, reaction-only evaluation of an ordinary
-// message. It never produces chat text and never blocks a real answer.
-func (b *Bot) maybeReact(ctx context.Context, c *girc.Client, ch string) {
+// maybeReact runs a rate-limited evaluation of an ordinary message. The model
+// answers with one emoji to react to the message that triggered the check, or
+// NONE. It never produces chat text and never blocks a real answer.
+func (b *Bot) maybeReact(ctx context.Context, c *girc.Client, ch, msgid string) {
 	r := b.cfg.Bot.Reactions
-	if !r.Enabled || !r.Spontaneous || b.busy.Load() {
+	if !r.Enabled || !r.Spontaneous || b.busy.Load() || msgid == "" {
 		return
 	}
 	interval := time.Duration(r.MinIntervalSeconds) * time.Second
@@ -603,11 +604,37 @@ func (b *Bot) maybeReact(ctx context.Context, c *girc.Client, ch string) {
 		if ctx.Err() != nil || !c.IsConnected() || !c.IsInChannel(ch) {
 			return
 		}
-		sent := b.applyReactions(c, ch, rep.Calls)
-		// Log-only: the model's private note is never sent to IRC, including when
-		// it decided that no reaction was warranted.
-		slog.Info("reaction check", "channel", ch, "reactions", sent, "note", logNote(rep.Text))
+		sent := 0
+		emoji := firstField(rep.Text)
+		if validReaction(emoji) && !strings.EqualFold(emoji, "NONE") && b.sendReaction(c, ch, emoji, msgid) {
+			sent = 1
+		}
+		slog.Info("reaction check", "channel", ch, "reactions", sent, "answer", logNote(rep.Text))
 	}()
+}
+
+// firstField returns the first whitespace-separated token of s, cleaned.
+func firstField(s string) string {
+	if f := strings.Fields(clean(s)); len(f) > 0 {
+		return f[0]
+	}
+	return ""
+}
+
+// sendReaction emits an IRCv3 reaction and records it in the history.
+func (b *Bot) sendReaction(c *girc.Client, ch, emoji, msgid string) bool {
+	if !c.HasCapability("message-tags") {
+		slog.Warn("reactions unavailable: server did not negotiate message-tags")
+		return false
+	}
+	raw := fmt.Sprintf("@+draft/react=%s;+reply=%s TAGMSG %s", escapeTagValue(emoji), escapeTagValue(msgid), ch)
+	if err := c.Cmd.SendRawNoSplit(raw); err != nil {
+		slog.Warn("sending reaction failed", "error", err)
+		return false
+	}
+	slog.Info("reacted", "channel", ch, "emoji", emoji, "msgid", msgid)
+	b.history.add(ch, Message{Role: "assistant", Content: fmt.Sprintf("[reacted %s to msgid=%s]", emoji, msgid)})
+	return true
 }
 
 // acceptTags records incoming reactions (+draft/react / +draft/unreact) as context.

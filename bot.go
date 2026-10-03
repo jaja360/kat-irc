@@ -113,6 +113,7 @@ type Bot struct {
 	cfg       Config
 	ai        *AI
 	history   *History
+	own       *ownMessages
 	ready     atomic.Bool
 	busy      atomic.Bool
 	reacting  atomic.Bool
@@ -120,6 +121,63 @@ type Bot struct {
 	last      time.Time
 	lastReact time.Time
 	requests  sync.WaitGroup
+}
+
+// ownMessages tracks the msgids of the bot's own recent messages per channel,
+// populated from echo-message, so the model can retract one.
+type ownMessages struct {
+	mu    sync.Mutex
+	limit int
+	ids   map[string][]ownMsg
+}
+
+type ownMsg struct {
+	id   string
+	text string
+}
+
+func newOwnMessages(limit int) *ownMessages {
+	return &ownMessages{limit: limit, ids: map[string][]ownMsg{}}
+}
+
+func (o *ownMessages) add(ch, id, text string) {
+	if o == nil || id == "" {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	v := append(o.ids[ch], ownMsg{id: id, text: text})
+	if len(v) > o.limit {
+		v = v[len(v)-o.limit:]
+	}
+	o.ids[ch] = v
+}
+
+func (o *ownMessages) has(ch, id string) bool {
+	if o == nil || id == "" {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, m := range o.ids[ch] {
+		if m.id == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (o *ownMessages) recent(ch string, n int) []ownMsg {
+	if o == nil {
+		return nil
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	v := o.ids[ch]
+	if len(v) > n {
+		v = v[len(v)-n:]
+	}
+	return append([]ownMsg(nil), v...)
 }
 
 // allowedChannel returns the canonical watched channel for target, or "".
@@ -189,9 +247,24 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 	go func() {
 		defer b.requests.Done()
 		defer b.busy.Store(false)
+		b.setTyping(c, ch, "active")
+		typingCleared := false
+		clearTyping := func() {
+			if typingCleared {
+				return
+			}
+			typingCleared = true
+			b.setTyping(c, ch, "done")
+		}
+		defer clearTyping()
 		reqCtx, cancel := context.WithTimeout(ctx, time.Duration(b.cfg.OpenAI.TimeoutSeconds)*time.Second)
 		defer cancel()
-		rep, err := b.ai.reply(reqCtx, snapshot, replyOptions{})
+		opts := replyOptions{presence: b.presenceSummary(c, ch)}
+		if b.cfg.Bot.Redaction && c.HasCapability("echo-message") && c.HasCapability("draft/message-redaction") {
+			opts.redact = true
+			opts.ownMessages = b.ownSummary(ch)
+		}
+		rep, err := b.ai.reply(reqCtx, snapshot, opts)
 		if ctx.Err() != nil || !c.IsConnected() || !c.IsInChannel(ch) {
 			return
 		}
@@ -200,12 +273,22 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 			c.Cmd.Message(ch, "Unable to answer: service unavailable or usage limit reached. Check the bot logs.")
 			return
 		}
-		// Reactions apply even when the model produced no text (react-only answer).
 		b.applyReactions(c, ch, rep.Calls)
+		b.applyRedactions(c, ch, rep.Calls)
+		replyTo := ""
+		switch b.cfg.Bot.ReplyThreading {
+		case "always":
+			replyTo = msgid
+		case "model":
+			replyTo = b.replyTarget(ch, rep.Calls)
+		}
 		lines := replyLines(rep.Text, b.cfg.Bot.MaxReplyLines)
+		lines = append(lines, b.applyImages(ctx, c, ch, rep.Calls)...)
 		if len(lines) == 0 {
 			return
 		}
+		// Clear the indicator as the answer starts, matching client behavior.
+		clearTyping()
 		for i, line := range lines {
 			if i > 0 {
 				select {
@@ -217,16 +300,14 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 			if !c.IsInChannel(ch) {
 				return
 			}
-			c.Cmd.Message(ch, line)
+			b.sendAnswer(c, ch, line, replyTo, i == 0)
 		}
 		b.history.add(ch, Message{Role: "assistant", Content: strings.Join(lines, "\n")})
 	}()
 }
 
-// applyReactions validates model tool calls and emits IRCv3 reactions. Only
-// msgids already seen in this channel are accepted, so a hallucinated target is
-// dropped instead of becoming a stray TAGMSG. It returns the number of reactions
-// actually sent.
+// applyReactions emits IRCv3 reactions. Only msgids seen in this channel are
+// accepted, so a hallucinated target is dropped instead of becoming a TAGMSG.
 func (b *Bot) applyReactions(c *girc.Client, ch string, calls []ToolCall) int {
 	if len(calls) == 0 || !b.cfg.Bot.Reactions.Enabled {
 		return 0
@@ -262,7 +343,7 @@ func (b *Bot) applyReactions(c *girc.Client, ch string, calls []ToolCall) int {
 			slog.Warn("ignoring reaction to unknown msgid", "msgid", args.MsgID)
 			continue
 		}
-		raw := fmt.Sprintf("@+draft/react=%s;+draft/reply=%s TAGMSG %s", escapeTagValue(emoji), escapeTagValue(args.MsgID), ch)
+		raw := fmt.Sprintf("@+draft/react=%s;+reply=%s TAGMSG %s", escapeTagValue(emoji), escapeTagValue(args.MsgID), ch)
 		if err := c.Cmd.SendRawNoSplit(raw); err != nil {
 			slog.Warn("sending reaction failed", "error", err)
 			continue
@@ -273,6 +354,190 @@ func (b *Bot) applyReactions(c *girc.Client, ch string, calls []ToolCall) int {
 		b.history.add(ch, Message{Role: "assistant", Content: fmt.Sprintf("[reacted %s to msgid=%s]", emoji, args.MsgID)})
 	}
 	return sent
+}
+
+// applyImages generates and uploads the model's image tool calls, returning the
+// URLs to post. Failures are logged and skipped, never posted as a partial line.
+func (b *Bot) applyImages(ctx context.Context, c *girc.Client, ch string, calls []ToolCall) []string {
+	if !b.cfg.Bot.Images.Enabled || len(calls) == 0 {
+		return nil
+	}
+	max := b.cfg.Bot.Images.MaxPerReply
+	if max < 1 {
+		max = 1
+	}
+	var urls []string
+	for _, call := range calls {
+		if len(urls) >= max {
+			break
+		}
+		if call.Name != imageToolName {
+			continue
+		}
+		var args struct {
+			Prompt string `json:"prompt"`
+		}
+		if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
+			slog.Warn("ignoring malformed image arguments", "error", err)
+			continue
+		}
+		prompt := strings.TrimSpace(clean(args.Prompt))
+		if prompt == "" || len(prompt) > 1000 {
+			slog.Warn("ignoring invalid image prompt")
+			continue
+		}
+		imgCtx, cancel := context.WithTimeout(ctx, time.Duration(b.cfg.Bot.Images.TimeoutSeconds)*time.Second)
+		data, err := b.ai.generateImage(imgCtx, prompt)
+		if err == nil {
+			var u string
+			if u, err = b.uploadImage(imgCtx, c, data); err == nil {
+				urls = append(urls, u)
+				slog.Info("image posted", "channel", ch, "bytes", len(data), "url", u)
+			}
+		}
+		cancel()
+		if err != nil {
+			slog.Warn("image generation or upload failed", "error", err)
+		}
+	}
+	return urls
+}
+
+// applyRedactions retracts one of the bot's own tracked messages, at most one per
+// answer. A foreign or hallucinated msgid is dropped.
+func (b *Bot) applyRedactions(c *girc.Client, ch string, calls []ToolCall) {
+	if !b.cfg.Bot.Redaction || b.own == nil || len(calls) == 0 {
+		return
+	}
+	for _, call := range calls {
+		if call.Name != redactToolName {
+			continue
+		}
+		var args struct {
+			MsgID  string `json:"msgid"`
+			Reason string `json:"reason"`
+		}
+		if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
+			slog.Warn("ignoring malformed redact arguments", "error", err)
+			return
+		}
+		if !b.own.has(ch, args.MsgID) {
+			slog.Warn("ignoring redact of unknown or foreign msgid", "msgid", args.MsgID)
+			return
+		}
+		raw := fmt.Sprintf("REDACT %s %s", ch, args.MsgID)
+		if reason := logNote(args.Reason); reason != "" {
+			raw += " :" + reason
+		}
+		if err := c.Cmd.SendRawNoSplit(raw); err != nil {
+			slog.Warn("redaction failed", "error", err)
+			return
+		}
+		slog.Info("redacted own message", "channel", ch, "msgid", args.MsgID, "reason", logNote(args.Reason))
+		b.history.add(ch, Message{Role: "assistant", Content: fmt.Sprintf("[redacted msgid=%s]", args.MsgID)})
+		return
+	}
+}
+
+// replyTarget returns the msgid the model chose to thread its answer to, or ""
+// to address the channel as a whole.
+func (b *Bot) replyTarget(ch string, calls []ToolCall) string {
+	for _, call := range calls {
+		if call.Name != replyToolName {
+			continue
+		}
+		var args struct {
+			MsgID string `json:"msgid"`
+		}
+		if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
+			slog.Warn("ignoring malformed reply arguments", "error", err)
+			continue
+		}
+		if b.history.hasMsgID(ch, args.MsgID) {
+			return args.MsgID
+		}
+		slog.Warn("ignoring reply to unknown msgid", "msgid", args.MsgID)
+	}
+	return ""
+}
+
+// setTyping emits the client-only "+typing" tag; a no-op unless typing is enabled
+// and message-tags was negotiated.
+func (b *Bot) setTyping(c *girc.Client, ch, state string) {
+	if !b.cfg.Bot.Typing || !c.IsConnected() || !c.HasCapability("message-tags") || !c.IsInChannel(ch) {
+		return
+	}
+	tags := girc.Tags{}
+	if err := tags.Set("+typing", state); err != nil {
+		return
+	}
+	c.Send(&girc.Event{Command: "TAGMSG", Tags: tags, Params: []string{ch}})
+}
+
+// sendAnswer posts one answer line, tagging the first as a reply when replyTo is set.
+func (b *Bot) sendAnswer(c *girc.Client, ch, line, replyTo string, first bool) {
+	if first && replyTo != "" && c.HasCapability("message-tags") {
+		tags := girc.Tags{}
+		if err := tags.Set("+reply", replyTo); err == nil {
+			c.Send(&girc.Event{Command: girc.PRIVMSG, Tags: tags, Params: []string{ch, line}})
+			return
+		}
+	}
+	c.Cmd.Message(ch, line)
+}
+
+// presenceSummary renders a bounded snapshot of the channel's members from girc's
+// tracked state (NAMES, join/part, away-notify, account-notify).
+func (b *Bot) presenceSummary(c *girc.Client, ch string) string {
+	if !b.cfg.Bot.Presence {
+		return ""
+	}
+	channel := c.LookupChannel(ch)
+	if channel == nil {
+		return ""
+	}
+	var entries []string
+	for _, u := range channel.Users(c) {
+		if u == nil || strings.EqualFold(u.Nick, c.GetNick()) {
+			continue
+		}
+		entry := clean(u.Nick)
+		if u.Extras.Account != "" {
+			entry += " (account " + clean(u.Extras.Account) + ")"
+		}
+		if u.Extras.Away != "" {
+			entry += " (away: " + logNote(u.Extras.Away) + ")"
+		}
+		entries = append(entries, entry)
+	}
+	if len(entries) == 0 {
+		return ""
+	}
+	total := len(entries)
+	const maxMembers = 40
+	more := ""
+	if total > maxMembers {
+		more = fmt.Sprintf(", and %d more", total-maxMembers)
+		entries = entries[:maxMembers]
+	}
+	return fmt.Sprintf("%s has %d other member(s): %s%s", ch, total, strings.Join(entries, ", "), more)
+}
+
+// ownSummary lists the bot's recent messages so the model can target one to redact.
+func (b *Bot) ownSummary(ch string) string {
+	msgs := b.own.recent(ch, 5)
+	if len(msgs) == 0 {
+		return ""
+	}
+	var parts []string
+	for _, m := range msgs {
+		text := m.text
+		if r := []rune(text); len(r) > 80 {
+			text = string(r[:80]) + "…"
+		}
+		parts = append(parts, fmt.Sprintf("[msgid:%s] %s", m.id, text))
+	}
+	return strings.Join(parts, "\n")
 }
 
 // maybeReact runs a rate-limited, reaction-only evaluation of an ordinary
@@ -300,7 +565,7 @@ func (b *Bot) maybeReact(ctx context.Context, c *girc.Client, ch string) {
 		defer b.reacting.Store(false)
 		reqCtx, cancel := context.WithTimeout(ctx, time.Duration(b.cfg.OpenAI.TimeoutSeconds)*time.Second)
 		defer cancel()
-		rep, err := b.ai.reply(reqCtx, snapshot, replyOptions{spontaneous: true})
+		rep, err := b.ai.reply(reqCtx, snapshot, replyOptions{spontaneous: true, presence: b.presenceSummary(c, ch)})
 		if err != nil {
 			// A silent no-op is normal here; only real failures are worth a log.
 			slog.Warn("reaction check failed", "error", err)
@@ -316,8 +581,7 @@ func (b *Bot) maybeReact(ctx context.Context, c *girc.Client, ch string) {
 	}()
 }
 
-// acceptTags records incoming IRCv3 reactions (+draft/react, +draft/reply) as
-// conversation context, so the bot can see who reacted to what.
+// acceptTags records incoming reactions (+draft/react / +draft/unreact) as context.
 func (b *Bot) acceptTags(c *girc.Client, e girc.Event) {
 	if !b.ready.Load() || e.Source == nil || len(e.Params) != 1 || strings.EqualFold(e.Source.Name, c.GetNick()) {
 		return
@@ -325,7 +589,13 @@ func (b *Bot) acceptTags(c *girc.Client, e girc.Event) {
 	if _, ok := e.Tags.Get("batch"); ok {
 		return
 	}
+	// Recording a removal keeps the model from acting on a stale reaction.
 	react, ok := e.Tags.Get("+draft/react")
+	action := "reacted"
+	if !ok {
+		react, ok = e.Tags.Get("+draft/unreact")
+		action = "removed reaction"
+	}
 	if !ok {
 		return
 	}
@@ -337,10 +607,14 @@ func (b *Bot) acceptTags(c *girc.Client, e girc.Event) {
 	if ch == "" {
 		return
 	}
-	replyTo, _ := e.Tags.Get("+draft/reply")
+	// Current clients use "+reply"; accept the older draft tag too.
+	replyTo, ok := e.Tags.Get("+reply")
+	if !ok {
+		replyTo, _ = e.Tags.Get("+draft/reply")
+	}
 	account, _ := e.Tags.Get("account")
-	b.history.add(ch, Message{Role: "user", Content: fmt.Sprintf("IRC nick=%s account=%s: reacted %s to msgid=%s", e.Source.Name, account, react, replyTo)})
-	slog.Info("reaction received", "channel", ch, "nick", e.Source.Name, "emoji", react, "msgid", replyTo)
+	b.history.add(ch, Message{Role: "user", Content: fmt.Sprintf("IRC nick=%s account=%s: %s %s to msgid=%s", e.Source.Name, account, action, react, replyTo)})
+	slog.Info("reaction received", "channel", ch, "nick", e.Source.Name, "action", action, "emoji", react, "msgid", replyTo)
 }
 
 func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
@@ -362,6 +636,10 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 	cfg := girc.Config{Server: b.cfg.IRC.Server, Port: b.cfg.IRC.Port, Nick: b.cfg.IRC.Nick, User: "kat", Name: "Configurable IRC assistant", SSL: b.cfg.IRC.TLS, TLSConfig: tc, DisableSTS: true, ServerPass: b.cfg.IRC.Password, Version: "kat-irc 0.2.0", HandleNickCollide: func(string) string { return "" }}
 	if b.cfg.IRC.SASLUser != "" {
 		cfg.SASL = &girc.SASLPlain{User: b.cfg.IRC.SASLUser, Pass: b.cfg.IRC.SASLPassword}
+	}
+	if b.cfg.Bot.Redaction {
+		// echo-message is how we learn the msgids of our own messages.
+		cfg.SupportedCaps = map[string][]string{"echo-message": nil, "draft/message-redaction": nil}
 	}
 	c := girc.New(cfg)
 	var saslOK atomic.Bool
@@ -426,6 +704,20 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 		c.Handlers.Add(numeric, func(c *girc.Client, e girc.Event) {
 			slog.Error("IRC registration/join failed", "numeric", e.Command)
 			go c.Close()
+		})
+	}
+	if b.cfg.Bot.Redaction {
+		c.Handlers.Add(girc.ALL_EVENTS, func(c *girc.Client, e girc.Event) {
+			if e.Command != girc.PRIVMSG || e.Source == nil || len(e.Params) < 1 || !strings.EqualFold(e.Source.Name, c.GetNick()) {
+				return
+			}
+			id, _ := e.Tags.Get("msgid")
+			if id == "" {
+				return
+			}
+			if ch := b.allowedChannel(e.Params[0]); ch != "" {
+				b.own.add(ch, id, clean(e.Last()))
+			}
 		})
 	}
 	return c, nil

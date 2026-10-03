@@ -12,14 +12,29 @@ MIT licensed. No personal profile or deployment-specific configuration is bundle
 - Negotiates IRCv3 capabilities with girc, including account tags, server time,
   message tags and batches. Supports SASL PLAIN. Ignores playback batches and
   messages timestamped before the current connection.
+- Threading is controlled by `bot.reply_threading`. With `model` (the default)
+  the model may mark an answer as an IRCv3 reply (`+reply`) to one earlier
+  message when it is answering a specific person, and otherwise addresses the
+  channel as a whole. `always` threads every answer to the triggering message;
+  `never` disables threading. Clients that render replies (for example goguma)
+  show the question inline. With `bot.typing`, it also sends `+typing=active`
+  while generating and `+typing=done` once the answer starts.
 - Keeps a bounded conversation history per channel. Ordinary channel messages
   become context; only addressed messages cause inference. `allowed_accounts`
   restricts inference to authenticated IRC accounts, not nicknames. It does not
   exclude other participants' messages from context.
-- Sees IRCv3 reactions: incoming `TAGMSG` with `+draft/react`/`+draft/reply` is
-  recorded as context, so the bot knows who reacted to which message.
+- Sees IRCv3 reactions: incoming `TAGMSG` with `+draft/react` and a `+reply`
+  target is recorded as context, so the bot knows who reacted to which message
+  (the older `+draft/reply` target tag is still accepted). A later
+  `+draft/unreact` is recorded too, so a removed reaction does not leave stale
+  context behind.
+- With `bot.presence`, each request also receives a bounded, live summary of the
+  channel's members from girc's IRCv3 state (NAMES, join/part, `away-notify`,
+  `account-notify`, `extended-join`), so the model can tell who is present, away
+  or authenticated. The summary is injected as instructions and never written to
+  the conversation history.
 - Can react back with emoji. When `reactions.enabled` is set, the model gets a
-  `react` tool and may attach `+draft/react` + `+draft/reply` client-only tags to
+  `react` tool and may attach `+draft/react` + `+reply` client-only tags to
   any message it saw in the conversation, not only the latest one. Message ids are
   exposed to the model as a `[msgid:…]` prefix; ids that were not actually seen in
   that channel are dropped, so a hallucinated target never becomes a stray TAGMSG.
@@ -29,6 +44,15 @@ MIT licensed. No personal profile or deployment-specific configuration is bundle
   `reactions.min_interval_seconds`, and never while a real answer is in flight.
   This bounds the extra inference cost; the model decides whether a reaction is
   warranted and may do nothing.
+- With `bot.redaction`, the model gets a `redact` tool and can retract one of its
+  own recent messages (IRCv3 `draft/message-redaction`, sent as `REDACT`). Only
+  msgids of messages the bot actually sent, learned from `echo-message`, are
+  accepted, and at most one per answer; the tool is not offered unless the server
+  negotiates both capabilities, so it fails closed.
+- With `bot.images`, the model also gets an `image` tool: it can generate an
+  image with a separate OpenAI image model, upload the bytes to the server's
+  `soju.im/FILEHOST` HTTP upload host, and post the resulting URL. The image is
+  produced by the configured image model, not by the chat model.
 - Makes one inference request at a time, with a cooldown and timeout. IRC PING
   handling remains active while inference runs. Replies are sanitized and split
   into bounded UTF-8 lines. Failed/incomplete streams are not posted as answers.
@@ -130,17 +154,30 @@ resolve beside the configuration file. The container reads `/data/config.json`.
 | `bot.persona`, `bot.persona_file`, `bot.memory_file` | Inline instructions plus optional external files |
 | `bot.history_messages`, `bot.history_file` | 1–200 recent messages per channel; empty path disables persistence |
 | `bot.cooldown_seconds`, `bot.max_reply_lines` | Minimum interval between requests and 1–20 output lines |
+| `bot.typing` | Send IRCv3 typing indicators (`+typing`) while generating an answer |
+| `bot.presence` | Add a live channel-membership summary (presence, away, account) to each request |
+| `bot.reply_threading` | `model` (default), `always` or `never`; whether answers carry a `+reply` tag |
 | `bot.allowed_accounts` | Optional IRC account allowlist; empty allows everyone in configured channels |
 | `bot.reactions.enabled` | Offer the `react` tool, handle incoming reactions; off unless set |
 | `bot.reactions.spontaneous` | Also evaluate ordinary messages for a reaction; requires `enabled` |
 | `bot.reactions.min_interval_seconds` | Minimum gap between spontaneous evaluations (default 180, minimum 15) |
 | `bot.reactions.max_per_reply` | Reactions emitted per model answer, 1–5 (default 2) |
+| `bot.images.enabled` | Offer the `image` tool: generate, upload and post an image URL; off unless set |
+| `bot.images.model` | OpenAI image-generation model (required when enabled), e.g. `gpt-image-1` |
+| `bot.images.api_key` | Platform API key for the Images API; required under ChatGPT OAuth, fallback `OPENAI_IMAGES_API_KEY` |
+| `bot.images.size` | Requested image size (default `1024x1024`) |
+| `bot.images.filehost` | Optional upload URL override; otherwise discovered from `soju.im/FILEHOST` |
+| `bot.images.max_per_reply` | Images generated per model answer, 1–2 (default 1) |
+| `bot.images.timeout_seconds` | Timeout for generation plus upload (default 120) |
+| `bot.redaction` | Offer the `redact` tool so the model can retract its own messages; off unless set |
 
 ### Reactions
 
 Reactions are IRCv3 client-only tags: the bot sends
-`@+draft/react=<emoji>;+draft/reply=<msgid> TAGMSG <channel>` and reads the same
-tags on incoming `TAGMSG`. Requirements and caveats:
+`@+draft/react=<emoji>;+reply=<msgid> TAGMSG <channel>` and reads the same tags on
+incoming `TAGMSG` (including `+draft/unreact` when a user removes a reaction), so
+the reaction target uses the ratified `+reply` tag. Older clients that send
+`+draft/reply` as the target are still understood. Requirements and caveats:
 
 - The IRC server must relay client-only tags and message ids, and the bot must
   negotiate `message-tags` (it does by default). Ergo does this; soju relays
@@ -160,6 +197,49 @@ tags on incoming `TAGMSG`. Requirements and caveats:
   `history.json`. Inspect with
   `kubectl -n kat-irc logs deploy/<deployment> | grep -E 'reacted|reaction check'`.
   As a consequence, the pod log contains short paraphrases of channel content.
+
+### Images
+
+`bot.images.enabled` offers the model an `image` tool. When it is called, Kat
+generates the image through the OpenAI Images API with the model named by
+`bot.images.model`, decodes the returned image data, uploads the bytes to the
+server's HTTP upload host, and posts the resulting URL. Requirements and caveats:
+
+- The image is produced by `bot.images.model` (an image model such as
+  `gpt-image-1`), not by the chat model; the chat model only decides to call the
+  tool. Confirm the identifier with `models` and your account's access.
+- Image generation is **not supported by the ChatGPT-plan OAuth flow** (OpenAI
+  lists image generation as an unsupported tool for that flow). It therefore needs
+  a Platform API key: set `bot.images.api_key` (or `OPENAI_IMAGES_API_KEY`) to keep
+  chat on ChatGPT OAuth, or set `openai.auth` to `api_key` to use the shared key for
+  both. Config validation rejects `images.enabled` under ChatGPT auth with no key.
+- Upload follows the soju `soju.im/FILEHOST` extension: a raw-body HTTP `POST`
+  carrying the image bytes with a `Content-Disposition` filename, authenticated
+  with the same HTTP scheme as the IRC connection (HTTP Basic for SASL PLAIN), so
+  `irc.sasl_user` / `irc.sasl_password` should be set for an authenticated host.
+  On success the `Location` header is resolved against the upload URL and posted.
+- The upload host is discovered from the `soju.im/FILEHOST` ISUPPORT token, or set
+  with `bot.images.filehost`. If neither is present the tool fails closed and logs
+  it, and over TLS a plaintext upload host is refused.
+- Images live on the file host: they are public to anyone with the URL, outlive
+  the conversation, and image generation is billed like any other image request.
+
+### Redaction
+
+`bot.redaction` offers the model a `redact` tool so it can retract one of its own
+messages (a user criticising the bot's message can prompt this). It requires the
+server to support `draft/message-redaction` and `echo-message`; the bot requests
+both only when redaction is enabled, and the tool is withheld when either is
+missing. Guardrails:
+
+- Only msgids of messages Kat itself sent are accepted. They are learned from
+  `echo-message` and kept in a bounded per-channel list, so the model cannot
+  redact another user's message or invent a target.
+- At most one message is retracted per answer, and only when a message is being
+  addressed to the bot (`allowed_accounts` still applies to triggers).
+- Redaction is permanent; clients that understand the extension show a tombstone.
+- soju passes `draft/message-redaction` through only when the upstream network
+  supports it, so the tool may simply be unavailable on some networks.
 
 The sample selects `gpt-6-luna` with low reasoning effort as a starting point for
 short conversational replies. Confirm availability using `models` in OAuth mode;

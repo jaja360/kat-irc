@@ -100,7 +100,7 @@ func waitForSetup(ctx context.Context, path string, interval time.Duration) (*Bo
 			h, err = newHistory(c.Bot.HistoryFile, c.Bot.HistoryMessages)
 		}
 		if err == nil {
-			return &Bot{cfg: c, ai: a, history: h}, nil
+			return &Bot{cfg: c, ai: a, history: h, own: newOwnMessages(50)}, nil
 		}
 		// Avoid logging configuration values, tokens, or file contents.
 		if stage != previous {

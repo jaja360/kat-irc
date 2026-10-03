@@ -17,6 +17,7 @@ type Config struct {
 		Server             string   `json:"server"`
 		Port               int      `json:"port"`
 		Nick               string   `json:"nick"`
+		User               string   `json:"user"`
 		Channels           []string `json:"channels"`
 		TLS                bool     `json:"tls"`
 		ServerName         string   `json:"server_name"`
@@ -132,6 +133,9 @@ func loadConfig(path string) (Config, error) {
 	}
 	if c.IRC.SASLPassword == "" {
 		c.IRC.SASLPassword = os.Getenv("IRC_SASL_PASSWORD")
+	}
+	if c.IRC.User == "" {
+		c.IRC.User = "kat"
 	}
 	if c.Bot.HistoryMessages < 1 || c.Bot.HistoryMessages > 200 {
 		return c, fmt.Errorf("history_messages must be 1..200")

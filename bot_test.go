@@ -1029,6 +1029,30 @@ func TestMemberList(t *testing.T) {
 	}
 }
 
+func TestUploadCredentials(t *testing.T) {
+	b := &Bot{}
+	if u, p := b.uploadCredentials(); u != "" || p != "" {
+		t.Fatal("empty config must yield no credentials", u, p)
+	}
+	var c Config
+	c.IRC.SASLUser = "kat/ergo"
+	c.IRC.SASLPassword = "saslpass"
+	b = &Bot{cfg: c}
+	if u, p := b.uploadCredentials(); u != "kat/ergo" || p != "saslpass" {
+		t.Fatal("SASL must take precedence", u, p)
+	}
+	c.IRC.SASLUser, c.IRC.SASLPassword = "", ""
+	c.IRC.User, c.IRC.Password = "kat/ergo", "passpass"
+	b = &Bot{cfg: c}
+	if u, p := b.uploadCredentials(); u != "kat/ergo" || p != "passpass" {
+		t.Fatal("PASS credentials fallback", u, p)
+	}
+	c.IRC.Password = ""
+	if u, _ := (&Bot{cfg: c}).uploadCredentials(); u != "" {
+		t.Fatal("missing password must yield no credentials", u)
+	}
+}
+
 func TestFilehostFromISupport(t *testing.T) {
 	soju := girc.Event{Params: []string{"*", "CHANTYPES=#", "soju.im/FILEHOST=https://soju.example/uploads", "are supported"}}
 	if got := filehostFromISupport(soju); got != "https://soju.example/uploads" {

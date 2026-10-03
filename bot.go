@@ -662,8 +662,9 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 	started := time.Now()
 	c.Handlers.Add("903", func(c *girc.Client, _ girc.Event) {
 		saslOK.Store(true)
-		// Forget sasl so girc never re-authenticates on a later CAP ACK.
-		c.RunHandlers(&girc.Event{Command: "CAP", Params: []string{"*", "DEL", "sasl"}})
+		// soju re-advertises sasl (CAP NEW) once the upstream connects. Dropping
+		// it stops girc re-authenticating, which soju would forward upstream.
+		c.Config.SASL = nil
 	})
 	c.Handlers.Add("005", func(_ *girc.Client, e girc.Event) {
 		// girc needs ISUPPORT to end in "this server"; soju ends in "are supported".

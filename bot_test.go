@@ -1108,19 +1108,18 @@ func TestIRCSASLNotRepeated(t *testing.T) {
 	send(":server 001 Kat :Welcome")
 	send(":server 005 Kat CHANTYPES=# CASEMAPPING=ascii :supported")
 	send(":server 376 Kat :End MOTD")
-	// soju connected upstream and announces new caps via cap-notify.
-	send(":server CAP Kat NEW account-notify")
-	newReq := until("CAP REQ ")
-	newCaps := strings.TrimPrefix(strings.TrimPrefix(newReq, "CAP REQ "), ":")
-	if !strings.Contains(newCaps, "account-notify") {
-		t.Fatal("expected CAP REQ for account-notify", newReq)
-	}
-	send(":server CAP Kat ACK :" + newCaps)
-	// A second AUTHENTICATE here is the reconnect-loop bug.
-	conn.SetReadDeadline(time.Now().Add(800 * time.Millisecond))
+	// soju re-advertises sasl once the upstream connects; girc must ignore it.
+	send(":server CAP Kat NEW sasl=PLAIN,ANONYMOUS")
+	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 	for scan.Scan() {
-		if strings.Contains(scan.Text(), "AUTHENTICATE") {
-			t.Fatalf("client re-authenticated after CAP NEW: %q", scan.Text())
+		l := scan.Text()
+		if strings.Contains(l, "AUTHENTICATE") {
+			t.Fatalf("client re-authenticated after CAP NEW sasl: %q", l)
+		}
+		if strings.HasPrefix(l, "CAP REQ ") {
+			// Faithful to soju: ack whatever the client asks to enable.
+			caps := strings.TrimPrefix(strings.TrimPrefix(l, "CAP REQ "), ":")
+			send(":server CAP Kat ACK :" + caps)
 		}
 	}
 	cancel()

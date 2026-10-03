@@ -218,9 +218,14 @@ server's HTTP upload host, and posts the resulting URL. Requirements and caveats
   with the same HTTP scheme as the IRC connection (HTTP Basic for SASL PLAIN), so
   `irc.sasl_user` / `irc.sasl_password` should be set for an authenticated host.
   On success the `Location` header is resolved against the upload URL and posted.
-- The upload host is discovered from the `soju.im/FILEHOST` ISUPPORT token, or set
-  with `bot.images.filehost`. If neither is present the tool fails closed and logs
-  it, and over TLS a plaintext upload host is refused.
+- The upload host is discovered from the `soju.im/FILEHOST` (soju) or
+  `draft/FILEHOST` (Ergo) ISUPPORT token, or set with `bot.images.filehost`, and
+  the advertised value is logged at startup. If none is present the tool fails
+  closed, logs it, and posts a short failure message instead of staying silent;
+  over TLS a plaintext upload host is refused. Note that a server advertises a
+  host only if it has one: Ergo requires an `additional-isupport` entry pointing
+  at an external upload server, and soju only advertises while it is the server
+  the bot is connected to.
 - Images live on the file host: they are public to anyone with the URL, outlive
   the conversation, and image generation is billed like any other image request.
 

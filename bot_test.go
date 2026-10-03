@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/lrstanley/girc"
 )
 
 func TestTrigger(t *testing.T) {
@@ -969,8 +971,9 @@ func TestIRCImageUpload(t *testing.T) {
 	send(":server CAP Kat ACK :" + strings.TrimPrefix(req, "CAP REQ :"))
 	until("CAP END")
 	send(":server 001 Kat :Welcome")
-	// girc only parses ISUPPORT when the trailing parameter ends with "this server".
-	send(":server 005 Kat CHANTYPES=# CASEMAPPING=ascii soju.im/FILEHOST=" + filehost.URL + " :are supported by this server")
+	// soju ends the ISUPPORT trailing parameter with "are supported", which girc
+	// ignores; the filehost must still be discovered.
+	send(":server 005 Kat CHANTYPES=# CASEMAPPING=ascii soju.im/FILEHOST=" + filehost.URL + " :are supported")
 	send(":server 376 Kat :End MOTD")
 	until("JOIN #chat")
 	send(":Kat!kat@localhost JOIN #chat")
@@ -991,6 +994,116 @@ func TestIRCImageUpload(t *testing.T) {
 	body, _ := uploaded.Load().([]byte)
 	if !bytes.Equal(body, want) {
 		t.Fatal("uploaded bytes differ", body)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown stuck")
+	}
+}
+
+func TestFilehostFromISupport(t *testing.T) {
+	soju := girc.Event{Params: []string{"*", "CHANTYPES=#", "soju.im/FILEHOST=https://soju.example/uploads", "are supported"}}
+	if got := filehostFromISupport(soju); got != "https://soju.example/uploads" {
+		t.Fatal("soju token not found", got)
+	}
+	ergo := girc.Event{Params: []string{"*", "draft/FILEHOST=https://ergo.example/files", "are supported by this server"}}
+	if got := filehostFromISupport(ergo); got != "https://ergo.example/files" {
+		t.Fatal("ergo token not found", got)
+	}
+	if got := filehostFromISupport(girc.Event{Params: []string{"*", "CHANTYPES=#"}}); got != "" {
+		t.Fatal("unexpected token", got)
+	}
+}
+
+func TestIRCImageNoFilehost(t *testing.T) {
+	// When the model asks for an image but no upload host is known, the bot must
+	// say so instead of failing silently.
+	listener, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer listener.Close()
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/responses":
+			fmt.Fprint(w, sseToolCall("", imageToolName, `{"prompt":"a cat"}`, "call_img"))
+		case "/images/generations":
+			resp, _ := json.Marshal(map[string]any{"data": []map[string]string{{"b64_json": base64.StdEncoding.EncodeToString([]byte("png"))}}})
+			w.Write(resp)
+		default:
+			t.Errorf("unexpected API path %q", r.URL.Path)
+		}
+	}))
+	defer api.Close()
+	t.Setenv("OPENAI_API_KEY", "test")
+	c, e := loadConfig("config.example.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	c.OpenAI.Auth = "api_key"
+	c.IRC.TLS = false
+	c.IRC.Server = "127.0.0.1"
+	c.IRC.Port = listener.Addr().(*net.TCPAddr).Port
+	c.Bot.HistoryFile = ""
+	c.Bot.Typing = false
+	c.Bot.Presence = false
+	c.Bot.Reactions.Enabled = false
+	c.Bot.ReplyThreading = "never"
+	c.Bot.Images.Enabled = true
+	c.Bot.Images.Model = "gpt-image-1"
+	c.Bot.Images.TimeoutSeconds = 30
+	a := &AI{cfg: c, http: &http.Client{}, endpoint: api.URL}
+	h, _ := newHistory("", 40)
+	b := &Bot{cfg: c, ai: a, history: h}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- b.run(ctx) }()
+	conn, e := listener.Accept()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
+	scan := bufio.NewScanner(conn)
+	send := func(s string) {
+		t.Helper()
+		if _, e := fmt.Fprint(conn, s+"\r\n"); e != nil {
+			t.Fatal(e)
+		}
+	}
+	until := func(sub string) string {
+		t.Helper()
+		for scan.Scan() {
+			l := scan.Text()
+			if strings.Contains(l, sub) {
+				return l
+			}
+		}
+		t.Fatalf("missing %q: %v", sub, scan.Err())
+		return ""
+	}
+	until("CAP LS")
+	send(":server CAP * LS :message-tags server-time account-tag batch")
+	req := until("CAP REQ :")
+	send(":server CAP Kat ACK :" + strings.TrimPrefix(req, "CAP REQ :"))
+	until("CAP END")
+	send(":server 001 Kat :Welcome")
+	// No FILEHOST token is advertised.
+	send(":server 005 Kat CHANTYPES=# CASEMAPPING=ascii :are supported")
+	send(":server 376 Kat :End MOTD")
+	until("JOIN #chat")
+	send(":Kat!kat@localhost JOIN #chat")
+	send(":server 353 Kat = #chat :Kat Alice")
+	send(":server 366 Kat #chat :End NAMES")
+	send("PING :joined")
+	until("PONG")
+	send("@account=alice;msgid=m1 :Alice!u@h PRIVMSG #chat :@Kat draw a cat")
+	got := until("couldn't generate that image")
+	if !strings.Contains(got, "PRIVMSG #chat") {
+		t.Fatal("fallback not posted to channel", got)
 	}
 	cancel()
 	select {

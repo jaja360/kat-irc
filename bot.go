@@ -114,6 +114,7 @@ type Bot struct {
 	ai          *AI
 	history     *History
 	own         *ownMessages
+	members     *memberList
 	filehostURL atomic.Value // string, from the 005 soju.im/FILEHOST token
 	ready       atomic.Bool
 	busy        atomic.Bool
@@ -501,41 +502,37 @@ func (b *Bot) sendAnswer(c *girc.Client, ch, line, replyTo string, first bool) {
 	c.Cmd.Message(ch, line)
 }
 
-// presenceSummary renders a bounded snapshot of the channel's members from girc's
-// tracked state (NAMES, join/part, away-notify, account-notify).
+// presenceSummary renders a bounded snapshot of the channel's members from our
+// own event-tracked state (NAMES, join/part, away-notify, account-notify).
 func (b *Bot) presenceSummary(c *girc.Client, ch string) string {
 	if !b.cfg.Bot.Presence {
 		return ""
 	}
-	channel := c.LookupChannel(ch)
-	if channel == nil {
+	members := b.members.summary(ch, c.GetNick())
+	if len(members) == 0 {
 		return ""
 	}
-	var entries []string
-	for _, u := range channel.Users(c) {
-		if u == nil || strings.EqualFold(u.Nick, c.GetNick()) {
-			continue
-		}
-		entry := clean(u.Nick)
-		if u.Extras.Account != "" {
-			entry += " (account " + clean(u.Extras.Account) + ")"
-		}
-		if u.Extras.Away != "" {
-			entry += " (away: " + logNote(u.Extras.Away) + ")"
-		}
-		entries = append(entries, entry)
-	}
-	if len(entries) == 0 {
-		return ""
-	}
-	total := len(entries)
+	total := len(members)
 	const maxMembers = 40
+	parts := make([]string, 0, min(total, maxMembers))
+	for _, m := range members {
+		if len(parts) >= maxMembers {
+			break
+		}
+		entry := clean(m.nick)
+		if m.account != "" {
+			entry += " (account " + clean(m.account) + ")"
+		}
+		if m.away != "" {
+			entry += " (away: " + logNote(m.away) + ")"
+		}
+		parts = append(parts, entry)
+	}
 	more := ""
 	if total > maxMembers {
 		more = fmt.Sprintf(", and %d more", total-maxMembers)
-		entries = entries[:maxMembers]
 	}
-	return fmt.Sprintf("%s has %d other member(s): %s%s", ch, total, strings.Join(entries, ", "), more)
+	return fmt.Sprintf("%s has %d other member(s): %s%s", ch, total, strings.Join(parts, ", "), more)
 }
 
 // ownSummary lists the bot's recent messages so the model can target one to redact.
@@ -755,6 +752,9 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 				b.own.add(ch, id, clean(e.Last()))
 			}
 		})
+	}
+	if b.cfg.Bot.Presence {
+		b.registerPresence(c)
 	}
 	return c, nil
 }

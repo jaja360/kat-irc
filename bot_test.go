@@ -745,7 +745,7 @@ func TestIRCPresence(t *testing.T) {
 	c.Bot.Reactions.Enabled = false
 	a := &AI{cfg: c, http: api.Client(), endpoint: api.URL}
 	h, _ := newHistory("", 40)
-	b := &Bot{cfg: c, ai: a, history: h}
+	b := &Bot{cfg: c, ai: a, history: h, members: newMemberList()}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -1000,6 +1000,32 @@ func TestIRCImageUpload(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("shutdown stuck")
+	}
+}
+
+func TestMemberList(t *testing.T) {
+	m := newMemberList()
+	m.join("#a", "Alice", "alice")
+	m.join("#a", "Bob", "")
+	m.setAway("Bob", "lunch")
+	m.setAccount("Bob", "bob")
+	m.join("#a", "Kat", "")
+	got := m.summary("#a", "Kat")
+	if len(got) != 2 || got[0].nick != "Alice" || got[0].account != "alice" ||
+		got[1].nick != "Bob" || got[1].away != "lunch" || got[1].account != "bob" {
+		t.Fatal("summary", got)
+	}
+	m.rename("Bob", "Robert")
+	if got := m.summary("#a", "Kat"); len(got) != 2 || got[1].nick != "Robert" {
+		t.Fatal("rename", got)
+	}
+	m.removeAll("Robert")
+	if got := m.summary("#a", "Kat"); len(got) != 1 || got[0].nick != "Alice" {
+		t.Fatal("removeAll", got)
+	}
+	m.clear("#a")
+	if got := m.summary("#a", "Kat"); len(got) != 0 {
+		t.Fatal("clear", got)
 	}
 }
 

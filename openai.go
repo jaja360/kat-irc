@@ -37,8 +37,9 @@ Rules:
 const spontaneousOnlyInstructions = `This is a silent reaction check for the latest message. Reply with exactly one emoji to
 react to it, or reply exactly NONE if it does not deserve a reaction. Output nothing else.
 Match the message's tone: congratulate praise, show warmth for kindness, amusement for
-jokes. If the message criticizes or mocks you, pick a sheepish, embarrassed or sad emoji,
-never a laughing one. Skip purely logistical or unclear messages.`
+jokes, and use 🤔 when the message is confusing or unclear. If the message criticizes or
+mocks you, pick a sheepish, embarrassed or sad emoji, never a laughing one. Skip purely
+logistical messages.`
 
 // presenceInstructions heads the live channel-membership snapshot.
 const presenceInstructions = `The IRC channel membership below is live state gathered from the server, not chat.

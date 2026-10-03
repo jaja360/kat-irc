@@ -648,7 +648,7 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 		}
 		tc.RootCAs = roots
 	}
-	cfg := girc.Config{Server: b.cfg.IRC.Server, Port: b.cfg.IRC.Port, Nick: b.cfg.IRC.Nick, User: "kat", Name: "Configurable IRC assistant", SSL: b.cfg.IRC.TLS, TLSConfig: tc, DisableSTS: true, ServerPass: b.cfg.IRC.Password, Version: "kat-irc 0.2.0", HandleNickCollide: func(string) string { return "" }}
+	cfg := girc.Config{Server: b.cfg.IRC.Server, Port: b.cfg.IRC.Port, Nick: b.cfg.IRC.Nick, User: "kat", Name: "Configurable IRC assistant", SSL: b.cfg.IRC.TLS, TLSConfig: tc, DisableSTS: true, ServerPass: b.cfg.IRC.Password, Version: "kat-irc 0.3.1", HandleNickCollide: func(string) string { return "" }}
 	if b.cfg.IRC.SASLUser != "" {
 		cfg.SASL = &girc.SASLPlain{User: b.cfg.IRC.SASLUser, Pass: b.cfg.IRC.SASLPassword}
 	}

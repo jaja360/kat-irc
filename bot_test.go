@@ -613,8 +613,7 @@ func TestIRCReactions(t *testing.T) {
 }
 
 func TestIRCTypingAndReply(t *testing.T) {
-	// Typing indicators must bracket inference, and the first answer line must
-	// carry a "+reply" client-only tag pointing at the triggering msgid.
+	// Typing brackets inference and the first line is threaded with +reply.
 	listener, e := net.Listen("tcp", "127.0.0.1:0")
 	if e != nil {
 		t.Fatal(e)
@@ -708,8 +707,7 @@ func TestIRCTypingAndReply(t *testing.T) {
 }
 
 func TestIRCPresence(t *testing.T) {
-	// Current channel membership, accounts and away state must reach the model
-	// through the instructions, without polluting the rolling history.
+	// Live membership reaches the model without polluting the history.
 	listener, e := net.Listen("tcp", "127.0.0.1:0")
 	if e != nil {
 		t.Fatal(e)
@@ -891,8 +889,7 @@ func TestImageConfig(t *testing.T) {
 }
 
 func TestIRCImageUpload(t *testing.T) {
-	// The model requests an image; Kat generates it via the Images API, uploads
-	// the bytes to the server file host, and posts the resolved URL as a reply.
+	// The model's image call is generated, uploaded, and posted as a reply.
 	listener, e := net.Listen("tcp", "127.0.0.1:0")
 	if e != nil {
 		t.Fatal(e)
@@ -994,8 +991,7 @@ func TestIRCImageUpload(t *testing.T) {
 	send(":server CAP Kat ACK :" + strings.TrimPrefix(req, "CAP REQ :"))
 	until("CAP END")
 	send(":server 001 Kat :Welcome")
-	// soju ends the ISUPPORT trailing parameter with "are supported", which girc
-	// ignores; the filehost must still be discovered.
+	// soju's ISUPPORT ends in "are supported"; the filehost must still be found.
 	send(":server 005 Kat CHANTYPES=# CASEMAPPING=ascii soju.im/FILEHOST=" + filehost.URL + " :are supported")
 	send(":server 376 Kat :End MOTD")
 	until("JOIN #chat")
@@ -1008,8 +1004,7 @@ func TestIRCImageUpload(t *testing.T) {
 		t.Fatal("not ready after JOIN")
 	}
 	send("@account=alice;msgid=m-img :Alice!u@h PRIVMSG #chat :@Kat draw a cat")
-	// girc omits the optional trailing ":" for a single-token message, so match
-	// on the command/target rather than "PRIVMSG #chat :".
+	// girc omits the trailing ":" for a single-token message.
 	got := until("PRIVMSG #chat ")
 	if !strings.Contains(got, "@+reply=m-img ") || !strings.Contains(got, "/upload/abc.png") {
 		t.Fatal("image URL not posted as a reply", got)
@@ -1053,8 +1048,7 @@ func TestMemberList(t *testing.T) {
 }
 
 func TestIRCSASLNotRepeated(t *testing.T) {
-	// girc re-sends AUTHENTICATE on any later CAP ACK, which soju triggers via
-	// CAP NEW (cap-notify). The bot must complete SASL once and not re-auth.
+	// A later CAP ACK (soju's CAP NEW) must not trigger a second AUTHENTICATE.
 	listener, e := net.Listen("tcp", "127.0.0.1:0")
 	if e != nil {
 		t.Fatal(e)
@@ -1176,8 +1170,7 @@ func TestFilehostFromISupport(t *testing.T) {
 }
 
 func TestIRCImageNoFilehost(t *testing.T) {
-	// When the model asks for an image but no upload host is known, the bot must
-	// say so instead of failing silently.
+	// A failed image call must post a visible error, not stay silent.
 	listener, e := net.Listen("tcp", "127.0.0.1:0")
 	if e != nil {
 		t.Fatal(e)
@@ -1393,8 +1386,7 @@ func TestOwnMessages(t *testing.T) {
 }
 
 func TestIRCRedaction(t *testing.T) {
-	// Kat learns the msgid of its own message from echo-message, then retracts it
-	// with REDACT when the model asks. Only its own tracked msgids are accepted.
+	// Kat learns its own msgid from echo-message, then retracts it via REDACT.
 	listener, e := net.Listen("tcp", "127.0.0.1:0")
 	if e != nil {
 		t.Fatal(e)

@@ -61,12 +61,10 @@ type Config struct {
 			MaxPerReply int `json:"max_per_reply"`
 		} `json:"reactions"`
 		Images struct {
-			Enabled  bool   `json:"enabled"`
-			Model    string `json:"model"`
-			Size     string `json:"size"`
-			Filehost string `json:"filehost"`
-			// APIKey is needed when chat uses ChatGPT OAuth, which cannot generate
-			// images; with API-key auth the shared key is used.
+			Enabled        bool   `json:"enabled"`
+			Model          string `json:"model"`
+			Size           string `json:"size"`
+			Filehost       string `json:"filehost"`
 			APIKey         string `json:"api_key"`
 			MaxPerReply    int    `json:"max_per_reply"`
 			TimeoutSeconds int    `json:"timeout_seconds"`
@@ -209,8 +207,6 @@ func loadConfig(path string) (Config, error) {
 		if c.Bot.Images.APIKey == "" {
 			c.Bot.Images.APIKey = os.Getenv("OPENAI_IMAGES_API_KEY")
 		}
-		// The ChatGPT-plan OAuth flow does not support image generation, so a
-		// separate Platform API key is required when chat uses that flow.
 		if c.OpenAI.Auth == "chatgpt" && c.Bot.Images.APIKey == "" {
 			return c, fmt.Errorf("images.enabled with openai.auth=chatgpt requires images.api_key (or OPENAI_IMAGES_API_KEY): the ChatGPT OAuth flow does not support image generation")
 		}

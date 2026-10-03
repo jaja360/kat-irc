@@ -20,10 +20,8 @@ type memberEntry struct {
 	away    string
 }
 
-// memberList tracks channel membership plus away/account state from the events
-// we observe. It deliberately does not read girc's tracked users: girc mutates
-// those fields under its own lock, and reading them from here would be a data
-// race. Methods are safe on a nil receiver so presence can be disabled.
+// memberList tracks channel membership and away/account state from observed
+// events. It does not read girc's user state, which girc mutates under its lock.
 type memberList struct {
 	mu    sync.Mutex
 	chans map[string]map[string]memberState
@@ -96,8 +94,7 @@ func (m *memberList) rename(from, to string) {
 	m.mu.Unlock()
 }
 
-// setAway and setAccount apply to every channel the nick appears in, because
-// AWAY and ACCOUNT are not channel-scoped.
+// setAway and setAccount apply to every channel the nick appears in.
 func (m *memberList) setAway(nick, away string) {
 	if m == nil {
 		return
@@ -145,8 +142,7 @@ func (m *memberList) summary(ch, self string) []memberEntry {
 	return out
 }
 
-// registerPresence keeps the member list current from the events that change
-// channel membership or per-user away/account state.
+// registerPresence feeds the member list from membership and away/account events.
 func (b *Bot) registerPresence(c *girc.Client) {
 	isSelf := func(e girc.Event) bool {
 		return e.Source != nil && strings.EqualFold(e.Source.Name, c.GetNick())

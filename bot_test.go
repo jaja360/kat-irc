@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -570,11 +572,24 @@ func TestIRCReactions(t *testing.T) {
 	}) {
 		t.Fatal("incoming reaction not recorded", b.history.snapshot("#chat"))
 	}
+	// Removing a reaction must also be recorded, so context does not stay stale.
+	send("@account=alice;+draft/unreact=🔥;+draft/reply=m-bob :Alice!u@h TAGMSG #chat")
+	if !waitFor(func() bool {
+		for _, m := range b.history.snapshot("#chat") {
+			if strings.Contains(m.Content, "removed reaction 🔥 to msgid=m-bob") {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatal("incoming unreact not recorded", b.history.snapshot("#chat"))
+	}
 	// Two messages, then an explicit trigger; the model reacts to the first one.
 	send("@account=alice;msgid=m-alice :Alice!u@h PRIVMSG #chat :hello from alice")
 	send("@account=alice :Alice!u@h PRIVMSG #chat :@Kat react please")
-	got := until("TAGMSG #chat")
-	if !strings.Contains(got, "+draft/react=😏") || !strings.Contains(got, "+draft/reply=m-alice") {
+	// Skip any typing indicator TAGMSG; select the reaction specifically.
+	got := until("+draft/react=")
+	if !strings.Contains(got, "+draft/react=😏") || !strings.Contains(got, "+reply=m-alice") {
 		t.Fatal("wrong reaction line", got)
 	}
 	if !strings.Contains(got, "@+draft/react=") {
@@ -586,6 +601,627 @@ func TestIRCReactions(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatal("wrong number of API calls", calls.Load())
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown stuck")
+	}
+}
+
+func TestIRCTypingAndReply(t *testing.T) {
+	// Typing indicators must bracket inference, and the first answer line must
+	// carry a "+reply" client-only tag pointing at the triggering msgid.
+	listener, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer listener.Close()
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, sse("pong answer"))
+	}))
+	defer api.Close()
+	t.Setenv("OPENAI_API_KEY", "test")
+	c, e := loadConfig("config.example.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	c.OpenAI.Auth = "api_key"
+	c.IRC.TLS = false
+	c.IRC.Server = "127.0.0.1"
+	c.IRC.Port = listener.Addr().(*net.TCPAddr).Port
+	c.Bot.HistoryFile = ""
+	c.Bot.AllowedAccounts = []string{"alice"}
+	c.Bot.Typing = true
+	c.Bot.Reactions.Enabled = false
+	c.Bot.ReplyThreading = "always" // this test asserts auto-threading
+	a := &AI{cfg: c, http: api.Client(), endpoint: api.URL}
+	h, _ := newHistory("", 40)
+	b := &Bot{cfg: c, ai: a, history: h}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- b.run(ctx) }()
+	conn, e := listener.Accept()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
+	scan := bufio.NewScanner(conn)
+	send := func(s string) {
+		t.Helper()
+		if _, e := fmt.Fprint(conn, s+"\r\n"); e != nil {
+			t.Fatal(e)
+		}
+	}
+	until := func(sub string) string {
+		t.Helper()
+		for scan.Scan() {
+			l := scan.Text()
+			if strings.Contains(l, sub) {
+				return l
+			}
+		}
+		t.Fatalf("missing %q: %v", sub, scan.Err())
+		return ""
+	}
+	until("CAP LS")
+	send(":server CAP * LS :message-tags server-time account-tag batch")
+	req := until("CAP REQ :")
+	send(":server CAP Kat ACK :" + strings.TrimPrefix(req, "CAP REQ :"))
+	until("CAP END")
+	send(":server 001 Kat :Welcome")
+	send(":server 005 Kat CHANTYPES=# CASEMAPPING=ascii :supported")
+	send(":server 376 Kat :End MOTD")
+	until("JOIN #chat")
+	send(":Kat!kat@localhost JOIN #chat")
+	send(":server 353 Kat = #chat :Kat Alice")
+	send(":server 366 Kat #chat :End NAMES")
+	send("PING :joined")
+	until("PONG")
+	if !b.ready.Load() {
+		t.Fatal("not ready after JOIN")
+	}
+	send("@account=alice;msgid=m-trigger :Alice!u@h PRIVMSG #chat :@Kat hello")
+	active := until("+typing=active")
+	if !strings.HasPrefix(active, "@+typing=active TAGMSG #chat") {
+		t.Fatal("wrong typing-active line", active)
+	}
+	doneLine := until("+typing=done")
+	if !strings.HasPrefix(doneLine, "@+typing=done TAGMSG #chat") {
+		t.Fatal("wrong typing-done line", doneLine)
+	}
+	answer := until("PRIVMSG #chat :")
+	if !strings.Contains(answer, "@+reply=m-trigger ") || !strings.Contains(answer, "pong answer") {
+		t.Fatal("answer not tagged as a reply", answer)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown stuck")
+	}
+}
+
+func TestIRCPresence(t *testing.T) {
+	// Current channel membership, accounts and away state must reach the model
+	// through the instructions, without polluting the rolling history.
+	listener, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer listener.Close()
+	var mu sync.Mutex
+	var instructions string
+	apiStarted := make(chan struct{}, 1)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if e := json.NewDecoder(r.Body).Decode(&body); e != nil {
+			t.Error(e)
+		}
+		mu.Lock()
+		instructions, _ = body["instructions"].(string)
+		mu.Unlock()
+		apiStarted <- struct{}{}
+		fmt.Fprint(w, sse("ok"))
+	}))
+	defer api.Close()
+	t.Setenv("OPENAI_API_KEY", "test")
+	c, e := loadConfig("config.example.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	c.OpenAI.Auth = "api_key"
+	c.IRC.TLS = false
+	c.IRC.Server = "127.0.0.1"
+	c.IRC.Port = listener.Addr().(*net.TCPAddr).Port
+	c.Bot.HistoryFile = ""
+	c.Bot.Typing = false
+	c.Bot.Presence = true
+	c.Bot.Reactions.Enabled = false
+	a := &AI{cfg: c, http: api.Client(), endpoint: api.URL}
+	h, _ := newHistory("", 40)
+	b := &Bot{cfg: c, ai: a, history: h}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- b.run(ctx) }()
+	conn, e := listener.Accept()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
+	scan := bufio.NewScanner(conn)
+	send := func(s string) {
+		t.Helper()
+		if _, e := fmt.Fprint(conn, s+"\r\n"); e != nil {
+			t.Fatal(e)
+		}
+	}
+	until := func(sub string) string {
+		t.Helper()
+		for scan.Scan() {
+			l := scan.Text()
+			if strings.Contains(l, sub) {
+				return l
+			}
+		}
+		t.Fatalf("missing %q: %v", sub, scan.Err())
+		return ""
+	}
+	until("CAP LS")
+	send(":server CAP * LS :message-tags server-time account-tag batch away-notify account-notify extended-join")
+	req := until("CAP REQ :")
+	send(":server CAP Kat ACK :" + strings.TrimPrefix(req, "CAP REQ :"))
+	until("CAP END")
+	send(":server 001 Kat :Welcome")
+	send(":server 005 Kat CHANTYPES=# CASEMAPPING=ascii :supported")
+	send(":server 376 Kat :End MOTD")
+	until("JOIN #chat")
+	send(":Kat!kat@localhost JOIN #chat")
+	send(":Alice!u@h JOIN #chat alice :Alice Example")
+	send(":Bob!u@h JOIN #chat * :Bob Example")
+	send(":server 353 Kat = #chat :Kat Alice Bob")
+	send(":server 366 Kat #chat :End NAMES")
+	send(":Bob!u@h AWAY :lunch")
+	// Barrier: every presence event above must be processed before the trigger.
+	send("PING :barrier")
+	until("PONG")
+	if !b.ready.Load() {
+		t.Fatal("not ready after JOIN")
+	}
+	send("@account=alice;msgid=m1 :Alice!u@h PRIVMSG #chat :@Kat who is here?")
+	select {
+	case <-apiStarted:
+	case <-time.After(8 * time.Second):
+		t.Fatal("no API call")
+	}
+	mu.Lock()
+	got := instructions
+	mu.Unlock()
+	for _, want := range []string{"Alice (account alice)", "Bob (away: lunch)", "2 other member(s)"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("presence missing %q in %q", want, got)
+		}
+	}
+	// Presence is advisory prompt state, never conversation history.
+	for _, m := range b.history.snapshot("#chat") {
+		if strings.Contains(m.Content, "other member") || strings.Contains(m.Content, "away: lunch") {
+			t.Fatal("presence leaked into history", m.Content)
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown stuck")
+	}
+}
+
+func TestImageConfig(t *testing.T) {
+	load := func(t *testing.T, images any) (Config, error) {
+		t.Helper()
+		raw, e := os.ReadFile("config.example.json")
+		if e != nil {
+			t.Fatal(e)
+		}
+		var m map[string]any
+		if e := json.Unmarshal(raw, &m); e != nil {
+			t.Fatal(e)
+		}
+		m["bot"].(map[string]any)["images"] = images
+		out, e := json.Marshal(m)
+		if e != nil {
+			t.Fatal(e)
+		}
+		path := filepath.Join(t.TempDir(), "config.json")
+		if e := os.WriteFile(path, out, 0600); e != nil {
+			t.Fatal(e)
+		}
+		return loadConfig(path)
+	}
+	if _, err := load(t, map[string]any{"enabled": true}); err == nil {
+		t.Fatal("images.model must be required when enabled")
+	}
+	if _, err := load(t, map[string]any{"enabled": true, "model": "gpt-image-1", "filehost": "ftp://host/x"}); err == nil {
+		t.Fatal("a non-http filehost must be rejected")
+	}
+	// config.example.json uses chatgpt auth, which cannot generate images.
+	if _, err := load(t, map[string]any{"enabled": true, "model": "gpt-image-1"}); err == nil {
+		t.Fatal("chatgpt auth must require a separate images.api_key")
+	}
+	c, err := load(t, map[string]any{"enabled": true, "model": "gpt-image-1", "api_key": "sk-img"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Bot.Images.Size != "1024x1024" || c.Bot.Images.MaxPerReply != 1 || c.Bot.Images.TimeoutSeconds != 120 {
+		t.Fatal("unexpected image defaults", c.Bot.Images)
+	}
+	if c.Bot.Images.APIKey != "sk-img" {
+		t.Fatal("images.api_key not preserved", c.Bot.Images.APIKey)
+	}
+}
+
+func TestIRCImageUpload(t *testing.T) {
+	// The model requests an image; Kat generates it via the Images API, uploads
+	// the bytes to the server file host, and posts the resolved URL as a reply.
+	listener, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer listener.Close()
+
+	want := []byte("\x89PNG\r\n\x1a\nfake-image-bytes")
+	var uploaded atomic.Value
+	filehost := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("filehost method %q", r.Method)
+		}
+		if ct := r.Header.Get("Content-Type"); ct != "image/png" {
+			t.Errorf("filehost content-type %q", ct)
+		}
+		if cd := r.Header.Get("Content-Disposition"); !strings.Contains(cd, "kat.png") {
+			t.Errorf("filehost disposition %q", cd)
+		}
+		body, _ := io.ReadAll(r.Body)
+		uploaded.Store(body)
+		w.Header().Set("Location", "/upload/abc.png")
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer filehost.Close()
+
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/responses":
+			fmt.Fprint(w, sseToolCall("", imageToolName, `{"prompt":"a cat astronaut"}`, "call_img"))
+		case "/images/generations":
+			var body map[string]any
+			if e := json.NewDecoder(r.Body).Decode(&body); e != nil {
+				t.Error(e)
+			}
+			if body["prompt"] != "a cat astronaut" || body["model"] != "gpt-image-1" {
+				t.Errorf("unexpected images request: %v", body)
+			}
+			resp, _ := json.Marshal(map[string]any{"data": []map[string]string{{"b64_json": base64.StdEncoding.EncodeToString(want)}}})
+			w.Write(resp)
+		default:
+			t.Errorf("unexpected API path %q", r.URL.Path)
+		}
+	}))
+	defer api.Close()
+
+	t.Setenv("OPENAI_API_KEY", "test")
+	c, e := loadConfig("config.example.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	c.OpenAI.Auth = "api_key"
+	c.IRC.TLS = false
+	c.IRC.Server = "127.0.0.1"
+	c.IRC.Port = listener.Addr().(*net.TCPAddr).Port
+	c.Bot.HistoryFile = ""
+	c.Bot.Typing = false
+	c.Bot.Presence = false
+	c.Bot.Reactions.Enabled = false
+	c.Bot.Images.Enabled = true
+	c.Bot.Images.Model = "gpt-image-1"
+	c.Bot.Images.MaxPerReply = 1
+	c.Bot.Images.TimeoutSeconds = 30
+	c.Bot.ReplyThreading = "always" // assert the image URL is threaded too
+	// A plain client can reach both mock servers over HTTP.
+	a := &AI{cfg: c, http: &http.Client{}, endpoint: api.URL}
+	h, _ := newHistory("", 40)
+	b := &Bot{cfg: c, ai: a, history: h}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- b.run(ctx) }()
+	conn, e := listener.Accept()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
+	scan := bufio.NewScanner(conn)
+	send := func(s string) {
+		t.Helper()
+		if _, e := fmt.Fprint(conn, s+"\r\n"); e != nil {
+			t.Fatal(e)
+		}
+	}
+	until := func(sub string) string {
+		t.Helper()
+		for scan.Scan() {
+			l := scan.Text()
+			if strings.Contains(l, sub) {
+				return l
+			}
+		}
+		t.Fatalf("missing %q: %v", sub, scan.Err())
+		return ""
+	}
+	until("CAP LS")
+	send(":server CAP * LS :message-tags server-time account-tag batch")
+	req := until("CAP REQ :")
+	send(":server CAP Kat ACK :" + strings.TrimPrefix(req, "CAP REQ :"))
+	until("CAP END")
+	send(":server 001 Kat :Welcome")
+	// girc only parses ISUPPORT when the trailing parameter ends with "this server".
+	send(":server 005 Kat CHANTYPES=# CASEMAPPING=ascii soju.im/FILEHOST=" + filehost.URL + " :are supported by this server")
+	send(":server 376 Kat :End MOTD")
+	until("JOIN #chat")
+	send(":Kat!kat@localhost JOIN #chat")
+	send(":server 353 Kat = #chat :Kat Alice")
+	send(":server 366 Kat #chat :End NAMES")
+	send("PING :joined")
+	until("PONG")
+	if !b.ready.Load() {
+		t.Fatal("not ready after JOIN")
+	}
+	send("@account=alice;msgid=m-img :Alice!u@h PRIVMSG #chat :@Kat draw a cat")
+	// girc omits the optional trailing ":" for a single-token message, so match
+	// on the command/target rather than "PRIVMSG #chat :".
+	got := until("PRIVMSG #chat ")
+	if !strings.Contains(got, "@+reply=m-img ") || !strings.Contains(got, "/upload/abc.png") {
+		t.Fatal("image URL not posted as a reply", got)
+	}
+	body, _ := uploaded.Load().([]byte)
+	if !bytes.Equal(body, want) {
+		t.Fatal("uploaded bytes differ", body)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown stuck")
+	}
+}
+
+func TestIRCReplyTool(t *testing.T) {
+	// In "model" mode the answer is threaded only when the model asks for it.
+	listener, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer listener.Close()
+	var calls atomic.Int32
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			fmt.Fprint(w, sseToolCall("hi alice", replyToolName, `{"msgid":"m1"}`, "c1"))
+			return
+		}
+		fmt.Fprint(w, sse("hi everyone"))
+	}))
+	defer api.Close()
+	t.Setenv("OPENAI_API_KEY", "test")
+	c, e := loadConfig("config.example.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	c.OpenAI.Auth = "api_key"
+	c.IRC.TLS = false
+	c.IRC.Server = "127.0.0.1"
+	c.IRC.Port = listener.Addr().(*net.TCPAddr).Port
+	c.Bot.HistoryFile = ""
+	c.Bot.Typing = false
+	c.Bot.Presence = false
+	c.Bot.Reactions.Enabled = false
+	c.Bot.Images.Enabled = false
+	c.Bot.CooldownSeconds = 0
+	c.Bot.ReplyThreading = "model"
+	a := &AI{cfg: c, http: api.Client(), endpoint: api.URL}
+	h, _ := newHistory("", 40)
+	b := &Bot{cfg: c, ai: a, history: h}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- b.run(ctx) }()
+	conn, e := listener.Accept()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
+	scan := bufio.NewScanner(conn)
+	send := func(s string) {
+		t.Helper()
+		if _, e := fmt.Fprint(conn, s+"\r\n"); e != nil {
+			t.Fatal(e)
+		}
+	}
+	until := func(sub string) string {
+		t.Helper()
+		for scan.Scan() {
+			l := scan.Text()
+			if strings.Contains(l, sub) {
+				return l
+			}
+		}
+		t.Fatalf("missing %q: %v", sub, scan.Err())
+		return ""
+	}
+	until("CAP LS")
+	send(":server CAP * LS :message-tags server-time account-tag batch")
+	req := until("CAP REQ :")
+	send(":server CAP Kat ACK :" + strings.TrimPrefix(req, "CAP REQ :"))
+	until("CAP END")
+	send(":server 001 Kat :Welcome")
+	send(":server 005 Kat CHANTYPES=# CASEMAPPING=ascii :supported")
+	send(":server 376 Kat :End MOTD")
+	until("JOIN #chat")
+	send(":Kat!kat@localhost JOIN #chat")
+	send(":server 353 Kat = #chat :Kat Alice")
+	send(":server 366 Kat #chat :End NAMES")
+	send("PING :joined")
+	until("PONG")
+	if !b.ready.Load() {
+		t.Fatal("not ready after JOIN")
+	}
+	// Model asks to thread: the answer carries +reply.
+	send("@account=alice;msgid=m1 :Alice!u@h PRIVMSG #chat :@Kat hi")
+	got := until("PRIVMSG #chat")
+	if !strings.Contains(got, "@+reply=m1 ") || !strings.Contains(got, "hi alice") {
+		t.Fatal("answer should be threaded", got)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for b.busy.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Model stays silent about threading: the answer addresses the channel.
+	send("@account=alice;msgid=m2 :Alice!u@h PRIVMSG #chat :@Kat hi all")
+	got2 := until("PRIVMSG #chat")
+	if strings.Contains(got2, "+reply") || !strings.Contains(got2, "hi everyone") {
+		t.Fatal("answer should not be threaded", got2)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown stuck")
+	}
+}
+
+func TestOwnMessages(t *testing.T) {
+	o := newOwnMessages(2)
+	o.add("#a", "m1", "one")
+	o.add("#a", "m2", "two")
+	o.add("#a", "m3", "three")
+	if o.has("#a", "m1") || !o.has("#a", "m2") || !o.has("#a", "m3") {
+		t.Fatal("oldest message must be evicted at the limit")
+	}
+	if o.has("#a", "") || o.has("#b", "m3") {
+		t.Fatal("must be non-empty and per-channel")
+	}
+	got := o.recent("#a", 5)
+	if len(got) != 2 || got[1].id != "m3" {
+		t.Fatal(got)
+	}
+}
+
+func TestIRCRedaction(t *testing.T) {
+	// Kat learns the msgid of its own message from echo-message, then retracts it
+	// with REDACT when the model asks. Only its own tracked msgids are accepted.
+	listener, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer listener.Close()
+	var calls atomic.Int32
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			fmt.Fprint(w, sse("hello from kat"))
+			return
+		}
+		fmt.Fprint(w, sseToolCall("", redactToolName, `{"msgid":"own1","reason":"wrong"}`, "call_r"))
+	}))
+	defer api.Close()
+	t.Setenv("OPENAI_API_KEY", "test")
+	c, e := loadConfig("config.example.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	c.OpenAI.Auth = "api_key"
+	c.IRC.TLS = false
+	c.IRC.Server = "127.0.0.1"
+	c.IRC.Port = listener.Addr().(*net.TCPAddr).Port
+	c.Bot.HistoryFile = ""
+	c.Bot.Typing = false
+	c.Bot.Presence = false
+	c.Bot.Reactions.Enabled = false
+	c.Bot.Images.Enabled = false
+	c.Bot.CooldownSeconds = 0
+	c.Bot.ReplyThreading = "never"
+	c.Bot.Redaction = true
+	a := &AI{cfg: c, http: api.Client(), endpoint: api.URL}
+	h, _ := newHistory("", 40)
+	b := &Bot{cfg: c, ai: a, history: h, own: newOwnMessages(50)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- b.run(ctx) }()
+	conn, e := listener.Accept()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
+	scan := bufio.NewScanner(conn)
+	send := func(s string) {
+		t.Helper()
+		if _, e := fmt.Fprint(conn, s+"\r\n"); e != nil {
+			t.Fatal(e)
+		}
+	}
+	until := func(sub string) string {
+		t.Helper()
+		for scan.Scan() {
+			l := scan.Text()
+			if strings.Contains(l, sub) {
+				return l
+			}
+		}
+		t.Fatalf("missing %q: %v", sub, scan.Err())
+		return ""
+	}
+	until("CAP LS")
+	send(":server CAP * LS :message-tags server-time account-tag batch echo-message draft/message-redaction")
+	req := until("CAP REQ :")
+	if !strings.Contains(req, "echo-message") || !strings.Contains(req, "draft/message-redaction") {
+		t.Fatal("redaction caps not requested", req)
+	}
+	send(":server CAP Kat ACK :" + strings.TrimPrefix(req, "CAP REQ :"))
+	until("CAP END")
+	send(":server 001 Kat :Welcome")
+	send(":server 005 Kat CHANTYPES=# CASEMAPPING=ascii :supported")
+	send(":server 376 Kat :End MOTD")
+	until("JOIN #chat")
+	send(":Kat!kat@localhost JOIN #chat")
+	send(":server 353 Kat = #chat :Kat Alice")
+	send(":server 366 Kat #chat :End NAMES")
+	send("PING :joined")
+	until("PONG")
+	if !b.ready.Load() {
+		t.Fatal("not ready after JOIN")
+	}
+	// The bot answers; the server echoes it back with a msgid.
+	send("@account=alice;msgid=t1 :Alice!u@h PRIVMSG #chat :@Kat say hi")
+	until("PRIVMSG #chat")
+	send("@msgid=own1 :Kat!kat@localhost PRIVMSG #chat :hello from kat")
+	send("PING :echo")
+	until("PONG")
+	deadline := time.Now().Add(3 * time.Second)
+	for b.busy.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The model now retracts its own message.
+	send("@account=alice;msgid=t2 :Alice!u@h PRIVMSG #chat :@Kat that was wrong, remove it")
+	// girc omits the optional trailing ":" for the single-token reason.
+	got := until("REDACT #chat own1")
+	if !strings.Contains(got, "wrong") {
+		t.Fatal("redaction missing reason", got)
 	}
 	cancel()
 	select {

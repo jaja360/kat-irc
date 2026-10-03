@@ -14,8 +14,7 @@ import (
 
 const apiBase = "https://api.openai.com/v1"
 
-// reactToolName is the Responses API function tool the model calls to add an
-// IRCv3 reaction (client-only tags +draft/react and +draft/reply) to a message.
+// reactToolName is the function tool the model calls to add a reaction.
 const reactToolName = "react"
 
 const reactInstructions = `You can react to messages with an emoji using the %q tool.
@@ -37,6 +36,61 @@ Call the %q tool only if a reaction is warranted. If nothing deserves a reaction
 not call the tool, and explain why in one short sentence (that note only appears in the
 bot's logs).`
 
+// presenceInstructions heads the live channel-membership snapshot.
+const presenceInstructions = `The IRC channel membership below is live state gathered from the server, not chat.
+Users marked "away" may not read or answer promptly; prefer addressing members who are
+present. The snapshot can be incomplete or slightly stale.`
+
+// replyToolName is the function tool the model calls to thread its answer.
+const replyToolName = "reply"
+
+const replyInstructions = `You can mark your answer as a threaded reply to one earlier message with the %q tool.
+Call it with "msgid" set to the id of the message you are answering directly, when your
+answer is aimed at one person. If you are speaking to the channel as a whole, do not
+call it. Only use msgid values you actually saw. Threading is optional.`
+
+func replyTool() any {
+	return map[string]any{
+		"type":        "function",
+		"name":        replyToolName,
+		"description": "Mark this answer as a threaded reply to one earlier message.",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"msgid": map[string]any{"type": "string", "description": "The [msgid:<id>] of the message being answered."},
+			},
+			"required":             []string{"msgid"},
+			"additionalProperties": false,
+		},
+	}
+}
+
+// redactToolName is the function tool the model calls to retract its own message.
+const redactToolName = "redact"
+
+const redactInstructions = `You can retract one of your own recent messages with the %q tool.
+Use it only when something you said should be removed, for example it was wrong,
+unwanted, or someone asked you to take it back. Redaction is permanent and visible
+to the channel. Set "msgid" to the id of one of your own messages listed below, and
+give a short "reason". At most one message per answer.`
+
+func redactTool() any {
+	return map[string]any{
+		"type":        "function",
+		"name":        redactToolName,
+		"description": "Retract one of your own earlier messages.",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"msgid":  map[string]any{"type": "string", "description": "The [msgid:<id>] of one of your own messages."},
+				"reason": map[string]any{"type": "string", "description": "Short reason, shown with the redaction."},
+			},
+			"required":             []string{"msgid"},
+			"additionalProperties": false,
+		},
+	}
+}
+
 type ToolCall struct {
 	Name      string
 	CallID    string
@@ -47,9 +101,13 @@ type Reply struct {
 	Calls []ToolCall
 }
 type replyOptions struct {
-	// spontaneous marks a "react or stay silent" evaluation: the model must
-	// not produce text, and an empty result is a normal outcome.
+	// spontaneous marks a "react or stay silent" evaluation: no text, and an
+	// empty result is a normal outcome.
 	spontaneous bool
+	presence    string
+	// redact offers the redact tool; ownMessages lists the messages it may target.
+	redact      bool
+	ownMessages string
 }
 
 type AI struct {
@@ -80,19 +138,37 @@ func (a *AI) token(ctx context.Context) (string, error) {
 	return oauthToken(ctx, a.cfg.OpenAI.CredentialsFile)
 }
 
-// instructions is the persona plus, when enabled, the reaction tool contract.
+// instructions is the persona plus the enabled tool contracts and presence.
 func (a *AI) instructions(opts replyOptions) string {
 	s := a.cfg.Bot.Persona
-	if !a.cfg.Bot.Reactions.Enabled {
-		return s
+	if a.cfg.Bot.Reactions.Enabled {
+		max := a.cfg.Bot.Reactions.MaxPerReply
+		if max < 1 {
+			max = 1
+		}
+		s += "\n\n" + fmt.Sprintf(reactInstructions, reactToolName, reactToolName, max)
+		if opts.spontaneous {
+			s += "\n\n" + fmt.Sprintf(spontaneousOnlyInstructions, reactToolName)
+		}
 	}
-	max := a.cfg.Bot.Reactions.MaxPerReply
-	if max < 1 {
-		max = 1
+	if a.cfg.Bot.Images.Enabled && !opts.spontaneous {
+		max := a.cfg.Bot.Images.MaxPerReply
+		if max < 1 {
+			max = 1
+		}
+		s += "\n\n" + fmt.Sprintf(imageInstructions, imageToolName, max)
 	}
-	s += "\n\n" + fmt.Sprintf(reactInstructions, reactToolName, reactToolName, max)
-	if opts.spontaneous {
-		s += "\n\n" + fmt.Sprintf(spontaneousOnlyInstructions, reactToolName)
+	if a.cfg.Bot.ReplyThreading == "model" && !opts.spontaneous {
+		s += "\n\n" + fmt.Sprintf(replyInstructions, replyToolName)
+	}
+	if opts.redact {
+		s += "\n\n" + fmt.Sprintf(redactInstructions, redactToolName)
+		if opts.ownMessages != "" {
+			s += "\nYour recent messages:\n" + opts.ownMessages
+		}
+	}
+	if opts.presence != "" {
+		s += "\n\n" + presenceInstructions + "\n" + opts.presence
 	}
 	return s
 }
@@ -110,22 +186,36 @@ func (a *AI) wireInput(messages []Message) []Message {
 	}
 	return out
 }
-func (a *AI) tools() []any {
-	return []any{map[string]any{
-		"type":        "function",
-		"name":        reactToolName,
-		"description": "Add an emoji reaction to one message of the conversation.",
-		"parameters": map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"emoji":  map[string]any{"type": "string", "description": "A single emoji, e.g. \"\U0001F60F\"."},
-				"msgid":  map[string]any{"type": "string", "description": "The id shown in the [msgid:<id>] prefix of the target message."},
-				"reason": map[string]any{"type": "string", "description": "Short private justification (not sent to IRC)."},
+func (a *AI) tools(opts replyOptions) []any {
+	var out []any
+	if a.cfg.Bot.Reactions.Enabled {
+		out = append(out, map[string]any{
+			"type":        "function",
+			"name":        reactToolName,
+			"description": "Add an emoji reaction to one message of the conversation.",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"emoji":  map[string]any{"type": "string", "description": "A single emoji, e.g. \"\U0001F60F\"."},
+					"msgid":  map[string]any{"type": "string", "description": "The id shown in the [msgid:<id>] prefix of the target message."},
+					"reason": map[string]any{"type": "string", "description": "Short private justification (not sent to IRC)."},
+				},
+				"required":             []string{"emoji", "msgid"},
+				"additionalProperties": false,
 			},
-			"required":             []string{"emoji", "msgid"},
-			"additionalProperties": false,
-		},
-	}}
+		})
+	}
+	// Image generation and reply threading are not offered on a silent check.
+	if a.cfg.Bot.Images.Enabled && !opts.spontaneous {
+		out = append(out, imageTool())
+	}
+	if a.cfg.Bot.ReplyThreading == "model" && !opts.spontaneous {
+		out = append(out, replyTool())
+	}
+	if opts.redact {
+		out = append(out, redactTool())
+	}
+	return out
 }
 
 func (a *AI) reply(ctx context.Context, messages []Message, opts replyOptions) (Reply, error) {
@@ -140,8 +230,8 @@ func (a *AI) reply(ctx context.Context, messages []Message, opts replyOptions) (
 	if a.cfg.OpenAI.ReasoningEffort != "" {
 		body["reasoning"] = map[string]string{"effort": a.cfg.OpenAI.ReasoningEffort}
 	}
-	if a.cfg.Bot.Reactions.Enabled {
-		body["tools"] = a.tools()
+	if tools := a.tools(opts); len(tools) > 0 {
+		body["tools"] = tools
 	}
 	b, e := json.Marshal(body)
 	if e != nil {

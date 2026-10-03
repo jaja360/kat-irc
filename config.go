@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,6 +44,9 @@ type Config struct {
 		CooldownSeconds int      `json:"cooldown_seconds"`
 		MaxReplyLines   int      `json:"max_reply_lines"`
 		AllowedAccounts []string `json:"allowed_accounts"`
+		Typing          bool     `json:"typing"`
+		Presence        bool     `json:"presence"`
+		ReplyThreading  string   `json:"reply_threading"`
 		Reactions       struct {
 			// Enabled offers the "react" tool and handles incoming TAGMSG
 			// reactions (context only). Disabled unless explicitly turned on.
@@ -55,6 +59,18 @@ type Config struct {
 			// MaxPerReply caps reactions emitted for one model answer.
 			MaxPerReply int `json:"max_per_reply"`
 		} `json:"reactions"`
+		Images struct {
+			Enabled  bool   `json:"enabled"`
+			Model    string `json:"model"`
+			Size     string `json:"size"`
+			Filehost string `json:"filehost"`
+			// APIKey is needed when chat uses ChatGPT OAuth, which cannot generate
+			// images; with API-key auth the shared key is used.
+			APIKey         string `json:"api_key"`
+			MaxPerReply    int    `json:"max_per_reply"`
+			TimeoutSeconds int    `json:"timeout_seconds"`
+		} `json:"images"`
+		Redaction bool `json:"redaction"`
 	} `json:"bot"`
 }
 
@@ -160,6 +176,44 @@ func loadConfig(path string) (Config, error) {
 	}
 	if c.Bot.Reactions.Spontaneous && c.Bot.Reactions.MinIntervalSeconds < 15 {
 		c.Bot.Reactions.MinIntervalSeconds = 180
+	}
+	if c.Bot.Images.Enabled {
+		if c.Bot.Images.Model == "" {
+			return c, fmt.Errorf("images.model is required when images.enabled")
+		}
+		if c.Bot.Images.Size == "" {
+			c.Bot.Images.Size = "1024x1024"
+		}
+		if c.Bot.Images.MaxPerReply < 1 {
+			c.Bot.Images.MaxPerReply = 1
+		}
+		if c.Bot.Images.MaxPerReply > 2 {
+			return c, fmt.Errorf("images.max_per_reply must be 1..2")
+		}
+		if c.Bot.Images.TimeoutSeconds < 1 {
+			c.Bot.Images.TimeoutSeconds = 120
+		}
+		if c.Bot.Images.Filehost != "" {
+			u, err := url.Parse(c.Bot.Images.Filehost)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				return c, fmt.Errorf("images.filehost must be an http(s) URL")
+			}
+		}
+		if c.Bot.Images.APIKey == "" {
+			c.Bot.Images.APIKey = os.Getenv("OPENAI_IMAGES_API_KEY")
+		}
+		// The ChatGPT-plan OAuth flow does not support image generation, so a
+		// separate Platform API key is required when chat uses that flow.
+		if c.OpenAI.Auth == "chatgpt" && c.Bot.Images.APIKey == "" {
+			return c, fmt.Errorf("images.enabled with openai.auth=chatgpt requires images.api_key (or OPENAI_IMAGES_API_KEY): the ChatGPT OAuth flow does not support image generation")
+		}
+	}
+	switch c.Bot.ReplyThreading {
+	case "":
+		c.Bot.ReplyThreading = "model"
+	case "model", "always", "never":
+	default:
+		return c, fmt.Errorf("reply_threading must be model, always or never")
 	}
 	return c, nil
 }

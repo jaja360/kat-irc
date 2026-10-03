@@ -29,12 +29,25 @@
     "history_file": "history.json",
     "cooldown_seconds": 3,
     "max_reply_lines": 6,
+    "typing": true,
+    "presence": true,
+    "reply_threading": "model",
     "allowed_accounts": [],
     "reactions": {
       "enabled": true,
       "spontaneous": true,
       "min_interval_seconds": 180,
       "max_per_reply": 2
-    }
+    },
+    "images": {
+      "enabled": false,
+      "model": "gpt-image-1",
+      "size": "1024x1024",
+      "filehost": "",
+      "api_key": "",
+      "max_per_reply": 1,
+      "timeout_seconds": 120
+    },
+    "redaction": false
   }
 }

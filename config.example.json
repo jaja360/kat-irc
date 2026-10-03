@@ -37,8 +37,7 @@
     "reactions": {
       "enabled": true,
       "spontaneous": true,
-      "min_interval_seconds": 180,
-      "max_per_reply": 2
+      "min_interval_seconds": 180
     },
     "images": {
       "enabled": false,

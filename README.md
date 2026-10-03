@@ -164,7 +164,6 @@ resolve beside the configuration file. The container reads `/data/config.json`.
 | `bot.reactions.enabled` | Offer the `react` tool, handle incoming reactions; off unless set |
 | `bot.reactions.spontaneous` | Also evaluate ordinary messages for a reaction; requires `enabled` |
 | `bot.reactions.min_interval_seconds` | Minimum gap between spontaneous evaluations (default 180, minimum 15) |
-| `bot.reactions.max_per_reply` | Reactions emitted per model answer, 1–5 (default 2) |
 | `bot.images.enabled` | Offer the `image` tool: generate, upload and post an image URL; off unless set |
 | `bot.images.model` | OpenAI image-generation model (required when enabled), e.g. `gpt-image-1` |
 | `bot.images.api_key` | Platform API key for the Images API; required under ChatGPT OAuth, fallback `OPENAI_IMAGES_API_KEY` |
@@ -189,15 +188,14 @@ the reaction target uses the ratified `+reply` tag. Older clients that send
 - Reactions target a message id, so the target message must still be inside the
   per-channel history window (`bot.history_messages`). Reacting to something
   further back is not possible.
-- `bot.reactions.spontaneous` adds one extra inference per interval, even when the
-  result is "no reaction". Raise `min_interval_seconds` to cut cost, or leave
-  `spontaneous` false to react only alongside triggered answers.
+- `bot.reactions.spontaneous` adds one extra inference per interval: the model
+  answers with a single emoji to react to the message that triggered the check, or
+  `NONE` to skip. Raise `min_interval_seconds` to cut cost, or leave `spontaneous`
+  false to react only alongside triggered answers.
 - Each reaction the bot sends is appended to the conversation history, which keeps
   it from reacting twice to the same message.
-- Logs: every sent reaction logs the model's `reason`, and every spontaneous check
-  logs its outcome explicitly, including `reactions=0` with the model's one-sentence
-  note. Both are logs only: the note is never sent to IRC and never stored in
-  `history.json`. Inspect with
+- Logs: every sent reaction logs the emoji, and every spontaneous check logs its
+  outcome (`reactions=1`/`0`, plus the model's answer). Inspect with
   `kubectl -n kat-irc logs deploy/<deployment> | grep -E 'reacted|reaction check'`.
   As a consequence, the pod log contains short paraphrases of channel content.
 

@@ -57,8 +57,6 @@ type Config struct {
 			Spontaneous bool `json:"spontaneous"`
 			// MinIntervalSeconds bounds the cost of spontaneous evaluations.
 			MinIntervalSeconds int `json:"min_interval_seconds"`
-			// MaxPerReply caps reactions emitted for one model answer.
-			MaxPerReply int `json:"max_per_reply"`
 		} `json:"reactions"`
 		Images struct {
 			Enabled        bool   `json:"enabled"`
@@ -167,14 +165,6 @@ func loadConfig(path string) (Config, error) {
 	}
 	if c.Bot.Reactions.Spontaneous && !c.Bot.Reactions.Enabled {
 		return c, fmt.Errorf("reactions.spontaneous requires reactions.enabled")
-	}
-	if c.Bot.Reactions.Enabled {
-		if c.Bot.Reactions.MaxPerReply < 1 {
-			c.Bot.Reactions.MaxPerReply = 2
-		}
-		if c.Bot.Reactions.MaxPerReply > 5 {
-			return c, fmt.Errorf("reactions.max_per_reply must be 1..5")
-		}
 	}
 	if c.Bot.Reactions.MinIntervalSeconds < 0 {
 		return c, fmt.Errorf("reactions.min_interval_seconds must be nonnegative")

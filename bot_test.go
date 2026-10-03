@@ -161,7 +161,6 @@ func TestOpenAIRequest(t *testing.T) {
 				c.OpenAI.MaxOutputTokens = 100
 				c.Bot.Persona = "test"
 				c.Bot.Reactions.Enabled = reactions
-				c.Bot.Reactions.MaxPerReply = 2
 				wantTools = reactions
 				a := &AI{cfg: c, http: server.Client(), endpoint: server.URL}
 				msgs := []Message{{Role: "user", Content: "hello", MsgID: "req1"}}
@@ -177,6 +176,32 @@ func TestOpenAIRequest(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestSpontaneousNoTools(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if e := json.NewDecoder(r.Body).Decode(&body); e != nil {
+			t.Error(e)
+		}
+		fmt.Fprint(w, sse("NONE"))
+	}))
+	defer server.Close()
+	var c Config
+	c.OpenAI.Auth = "api_key"
+	c.OpenAI.APIKey = "test-key"
+	c.OpenAI.Model = "test"
+	c.OpenAI.MaxOutputTokens = 100
+	c.Bot.Persona = "test"
+	c.Bot.Reactions.Enabled = true
+	a := &AI{cfg: c, http: server.Client(), endpoint: server.URL}
+	if _, e := a.reply(context.Background(), []Message{{Role: "user", Content: "hi"}}, replyOptions{spontaneous: true}); e != nil {
+		t.Fatal(e)
+	}
+	if _, ok := body["tools"]; ok {
+		t.Fatal("a silent check must not offer tools")
 	}
 }
 
@@ -371,7 +396,7 @@ func TestSpontaneousThrottle(t *testing.T) {
 		if s, _ := body["instructions"].(string); !strings.Contains(s, "silent reaction check") {
 			t.Error("spontaneous turn must use the silent instructions")
 		}
-		fmt.Fprint(w, sse("Nothing here deserves a reaction."))
+		fmt.Fprint(w, sse("NONE"))
 		checked <- struct{}{}
 	}))
 	defer api.Close()
@@ -388,7 +413,6 @@ func TestSpontaneousThrottle(t *testing.T) {
 	c.Bot.Reactions.Enabled = true
 	c.Bot.Reactions.Spontaneous = true
 	c.Bot.Reactions.MinIntervalSeconds = 600
-	c.Bot.Reactions.MaxPerReply = 2
 	a := &AI{cfg: c, http: api.Client(), endpoint: api.URL}
 	h, _ := newHistory("", 40)
 	b := &Bot{cfg: c, ai: a, history: h}
@@ -468,6 +492,92 @@ func TestSpontaneousThrottle(t *testing.T) {
 	}
 }
 
+func TestIRCSpontaneousReaction(t *testing.T) {
+	// A silent check answers with one emoji, which the bot turns into a reaction
+	// to the message that triggered the check.
+	listener, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer listener.Close()
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, sse("👍"))
+	}))
+	defer api.Close()
+	t.Setenv("OPENAI_API_KEY", "test")
+	c, e := loadConfig("config.example.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	c.OpenAI.Auth = "api_key"
+	c.IRC.TLS = false
+	c.IRC.Server = "127.0.0.1"
+	c.IRC.Port = listener.Addr().(*net.TCPAddr).Port
+	c.Bot.HistoryFile = ""
+	c.Bot.Reactions.Enabled = true
+	c.Bot.Reactions.Spontaneous = true
+	c.Bot.Reactions.MinIntervalSeconds = 600
+	a := &AI{cfg: c, http: api.Client(), endpoint: api.URL}
+	h, _ := newHistory("", 40)
+	b := &Bot{cfg: c, ai: a, history: h}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- b.run(ctx) }()
+	conn, e := listener.Accept()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
+	scan := bufio.NewScanner(conn)
+	send := func(s string) {
+		t.Helper()
+		if _, e := fmt.Fprint(conn, s+"\r\n"); e != nil {
+			t.Fatal(e)
+		}
+	}
+	until := func(sub string) string {
+		t.Helper()
+		for scan.Scan() {
+			l := scan.Text()
+			if strings.Contains(l, sub) {
+				return l
+			}
+		}
+		t.Fatalf("missing %q: %v", sub, scan.Err())
+		return ""
+	}
+	until("CAP LS")
+	send(":server CAP * LS :message-tags server-time account-tag batch")
+	req := until("CAP REQ :")
+	send(":server CAP Kat ACK :" + strings.TrimPrefix(req, "CAP REQ :"))
+	until("CAP END")
+	send(":server 001 Kat :Welcome")
+	send(":server 005 Kat CHANTYPES=# CASEMAPPING=ascii :supported")
+	send(":server 376 Kat :End MOTD")
+	until("JOIN #chat")
+	send(":Kat!kat@localhost JOIN #chat")
+	send(":server 353 Kat = #chat :Kat Alice")
+	send(":server 366 Kat #chat :End NAMES")
+	send("PING :joined")
+	until("PONG")
+	if !b.ready.Load() {
+		t.Fatal("not ready after JOIN")
+	}
+	send("@account=alice;msgid=m1 :Alice!u@h PRIVMSG #chat :bien joué")
+	got := until("TAGMSG #chat")
+	if !strings.Contains(got, "+draft/react=👍") || !strings.Contains(got, "+reply=m1") {
+		t.Fatal("wrong reaction line", got)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown stuck")
+	}
+}
+
 func TestIRCReactions(t *testing.T) {
 	// The bot must see IRCv3 reactions and be able to send one back, including
 	// as a tool call targeting an older message identified by its msgid.
@@ -503,7 +613,6 @@ func TestIRCReactions(t *testing.T) {
 	c.Bot.AllowedAccounts = []string{"alice"}
 	c.Bot.Reactions.Enabled = true
 	c.Bot.Reactions.Spontaneous = false
-	c.Bot.Reactions.MaxPerReply = 2
 	a := &AI{cfg: c, http: api.Client(), endpoint: api.URL}
 	h, _ := newHistory("", 40)
 	b := &Bot{cfg: c, ai: a, history: h}

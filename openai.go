@@ -17,6 +17,9 @@ const apiBase = "https://api.openai.com/v1"
 // reactToolName is the function tool the model calls to add a reaction.
 const reactToolName = "react"
 
+// maxReactionsPerTurn caps reactions emitted in one triggered answer.
+const maxReactionsPerTurn = 2
+
 const reactInstructions = `You can react to messages with an emoji using the %q tool.
 
 Every message coming from IRC is prefixed with [msgid:<id>]. To react, call %q with
@@ -27,14 +30,16 @@ Rules:
 - Only use msgid values you actually saw in the conversation.
 - Never react to your own messages.
 - At most %d reaction(s) per answer, and only when it genuinely fits.
+- Match the tone: never react with laughter to criticism or bad news aimed at you.
 - Reacting is optional: if nothing is worth a reaction, do not call the tool.
 - The reason is a private one-sentence note; it is never sent to IRC.`
 
-const spontaneousOnlyInstructions = `This is a silent reaction check: any text you produce is discarded and never sent.
-Call the %q tool when a reaction would fit — a message that is funny, kind, surprising, or
-simply worth acknowledging usually deserves one. Prefer reacting unless the message is
-purely logistical. If nothing warrants a reaction, do not call the tool and say why in one
-short sentence (logs only).`
+const spontaneousOnlyInstructions = `This is a silent reaction check for the latest message. Reply with exactly one emoji to
+react to it, or reply exactly NONE if it does not deserve a reaction. Output nothing else.
+Match the message's tone: congratulate praise, show warmth for kindness, amusement for
+jokes, and use 🤔 when the message is confusing or unclear. If the message criticizes or
+mocks you, pick a sheepish, embarrassed or sad emoji, never a laughing one. Skip purely
+logistical messages.`
 
 // presenceInstructions heads the live channel-membership snapshot.
 const presenceInstructions = `The IRC channel membership below is live state gathered from the server, not chat.
@@ -123,13 +128,10 @@ func (a *AI) token(ctx context.Context) (string, error) {
 func (a *AI) instructions(opts replyOptions) string {
 	s := a.cfg.Bot.Persona
 	if a.cfg.Bot.Reactions.Enabled {
-		max := a.cfg.Bot.Reactions.MaxPerReply
-		if max < 1 {
-			max = 1
-		}
-		s += "\n\n" + fmt.Sprintf(reactInstructions, reactToolName, reactToolName, max)
 		if opts.spontaneous {
-			s += "\n\n" + fmt.Sprintf(spontaneousOnlyInstructions, reactToolName)
+			s += "\n\n" + spontaneousOnlyInstructions
+		} else {
+			s += "\n\n" + fmt.Sprintf(reactInstructions, reactToolName, reactToolName, maxReactionsPerTurn)
 		}
 	}
 	if a.cfg.Bot.Images.Enabled && !opts.spontaneous {
@@ -169,7 +171,8 @@ func (a *AI) wireInput(messages []Message) []Message {
 }
 func (a *AI) tools(opts replyOptions) []any {
 	var out []any
-	if a.cfg.Bot.Reactions.Enabled {
+	// A silent check returns an emoji as text, not a tool call.
+	if a.cfg.Bot.Reactions.Enabled && !opts.spontaneous {
 		out = append(out, map[string]any{
 			"type":        "function",
 			"name":        reactToolName,

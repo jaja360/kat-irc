@@ -103,6 +103,19 @@ func (a *AI) generateImage(ctx context.Context, prompt string) ([]byte, error) {
 	return data, nil
 }
 
+// uploadCredentials returns the HTTP Basic credentials for the file host: the
+// SASL PLAIN pair when configured, otherwise the PASS credentials, so a soju
+// connection without SASL can still authenticate its uploads.
+func (b *Bot) uploadCredentials() (string, string) {
+	if b.cfg.IRC.SASLUser != "" {
+		return b.cfg.IRC.SASLUser, b.cfg.IRC.SASLPassword
+	}
+	if b.cfg.IRC.Password != "" && b.cfg.IRC.User != "" {
+		return b.cfg.IRC.User, b.cfg.IRC.Password
+	}
+	return "", ""
+}
+
 // filehostFromISupport extracts a soju.im/FILEHOST or draft/FILEHOST value from
 // a 005 event. Ergo advertises draft/FILEHOST; soju advertises soju.im/FILEHOST.
 func filehostFromISupport(e girc.Event) string {
@@ -153,8 +166,8 @@ func (b *Bot) uploadImage(ctx context.Context, c *girc.Client, data []byte) (str
 	}
 	req.Header.Set("Content-Type", "image/png")
 	req.Header.Set("Content-Disposition", `attachment; filename="kat.png"`)
-	if b.cfg.IRC.SASLUser != "" {
-		req.SetBasicAuth(b.cfg.IRC.SASLUser, b.cfg.IRC.SASLPassword)
+	if user, pass := b.uploadCredentials(); user != "" {
+		req.SetBasicAuth(user, pass)
 	}
 	res, err := b.ai.http.Do(req)
 	if err != nil {

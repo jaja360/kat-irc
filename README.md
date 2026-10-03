@@ -144,6 +144,7 @@ resolve beside the configuration file. The container reads `/data/config.json`.
 | `irc.tls` | Enable certificate-verified TLS, minimum TLS 1.2 |
 | `irc.server_name`, `irc.ca_file` | Optional TLS name override and custom CA |
 | `irc.password` | Optional IRC server password; fallback `IRC_PASSWORD` |
+| `irc.user` | IRC username/ident (default `kat`); with soju PASS auth use `<soju-user>/<network>` |
 | `irc.sasl_user`, `irc.sasl_password` | SASL PLAIN credentials; password fallback `IRC_SASL_PASSWORD` |
 | `irc.allow_plaintext_auth` | Explicit opt-in to send IRC passwords without TLS |
 | `openai.auth` | Exactly `chatgpt` or `api_key` |
@@ -215,9 +216,15 @@ server's HTTP upload host, and posts the resulting URL. Requirements and caveats
   both. Config validation rejects `images.enabled` under ChatGPT auth with no key.
 - Upload follows the soju `soju.im/FILEHOST` extension: a raw-body HTTP `POST`
   carrying the image bytes with a `Content-Disposition` filename, authenticated
-  with the same HTTP scheme as the IRC connection (HTTP Basic for SASL PLAIN), so
-  `irc.sasl_user` / `irc.sasl_password` should be set for an authenticated host.
-  On success the `Location` header is resolved against the upload URL and posted.
+  with HTTP Basic using `irc.sasl_user` / `irc.sasl_password` when set, otherwise
+  `irc.user` / `irc.password`. On success the `Location` header is resolved against
+  the upload URL and posted.
+- Through a soju bouncer, prefer **PASS auth over SASL**: set `irc.user` to
+  `<soju-user>/<network>` and `irc.password` to the soju password (with
+  `allow_plaintext_auth` when not using TLS), leaving `irc.sasl_*` empty. girc
+  re-sends `AUTHENTICATE` after soju's `CAP NEW` (cap-notify), which soju treats as
+  upstream SASL and forwards the bouncer username `<soju-user>/<network>` to the
+  network; PASS avoids that entirely.
 - The upload host is discovered from the `soju.im/FILEHOST` (soju) or
   `draft/FILEHOST` (Ergo) ISUPPORT token, or set with `bot.images.filehost`, and
   the advertised value is logged at startup. If none is present the tool fails

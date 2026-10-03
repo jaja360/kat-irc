@@ -125,8 +125,7 @@ type Bot struct {
 	requests    sync.WaitGroup
 }
 
-// ownMessages tracks the msgids of the bot's own recent messages per channel,
-// populated from echo-message, so the model can retract one.
+// ownMessages tracks the bot's own recent message ids per channel (echo-message).
 type ownMessages struct {
 	mu    sync.Mutex
 	limit int
@@ -293,7 +292,6 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 			}
 			return
 		}
-		// Clear the indicator as the answer starts, matching client behavior.
 		clearTyping()
 		for i, line := range lines {
 			if i > 0 {
@@ -312,8 +310,7 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 	}()
 }
 
-// applyReactions emits IRCv3 reactions. Only msgids seen in this channel are
-// accepted, so a hallucinated target is dropped instead of becoming a TAGMSG.
+// applyReactions emits reactions, accepting only msgids seen in this channel.
 func (b *Bot) applyReactions(c *girc.Client, ch string, calls []ToolCall) int {
 	if len(calls) == 0 || !b.cfg.Bot.Reactions.Enabled {
 		return 0
@@ -362,8 +359,7 @@ func (b *Bot) applyReactions(c *girc.Client, ch string, calls []ToolCall) int {
 	return sent
 }
 
-// applyImages generates and uploads the model's image tool calls, returning the
-// URLs to post. Failures are logged and skipped, never posted as a partial line.
+// applyImages generates and uploads image tool calls, returning URLs to post.
 func (b *Bot) applyImages(ctx context.Context, c *girc.Client, ch string, calls []ToolCall) []string {
 	if !b.cfg.Bot.Images.Enabled || len(calls) == 0 {
 		return nil
@@ -410,8 +406,7 @@ func (b *Bot) applyImages(ctx context.Context, c *girc.Client, ch string, calls 
 	return urls
 }
 
-// applyRedactions retracts one of the bot's own tracked messages, at most one per
-// answer. A foreign or hallucinated msgid is dropped.
+// applyRedactions retracts one of the bot's own tracked messages.
 func (b *Bot) applyRedactions(c *girc.Client, ch string, calls []ToolCall) {
 	if !b.cfg.Bot.Redaction || b.own == nil || len(calls) == 0 {
 		return
@@ -455,8 +450,7 @@ func hasToolCall(calls []ToolCall, name string) bool {
 	return false
 }
 
-// replyTarget returns the msgid the model chose to thread its answer to, or ""
-// to address the channel as a whole.
+// replyTarget returns the msgid to thread the answer to, or "" for the channel.
 func (b *Bot) replyTarget(ch string, calls []ToolCall) string {
 	for _, call := range calls {
 		if call.Name != replyToolName {
@@ -477,8 +471,7 @@ func (b *Bot) replyTarget(ch string, calls []ToolCall) string {
 	return ""
 }
 
-// setTyping emits the client-only "+typing" tag; a no-op unless typing is enabled
-// and message-tags was negotiated.
+// setTyping emits the client-only "+typing" tag.
 func (b *Bot) setTyping(c *girc.Client, ch, state string) {
 	if !b.cfg.Bot.Typing || !c.IsConnected() || !c.HasCapability("message-tags") || !c.IsInChannel(ch) {
 		return
@@ -502,8 +495,7 @@ func (b *Bot) sendAnswer(c *girc.Client, ch, line, replyTo string, first bool) {
 	c.Cmd.Message(ch, line)
 }
 
-// presenceSummary renders a bounded snapshot of the channel's members from our
-// own event-tracked state (NAMES, join/part, away-notify, account-notify).
+// presenceSummary renders a bounded snapshot of the channel's tracked members.
 func (b *Bot) presenceSummary(c *girc.Client, ch string) string {
 	if !b.cfg.Bot.Presence {
 		return ""
@@ -668,10 +660,13 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 		}
 	}
 	started := time.Now()
-	c.Handlers.Add("903", func(_ *girc.Client, _ girc.Event) { saslOK.Store(true) })
+	c.Handlers.Add("903", func(c *girc.Client, _ girc.Event) {
+		saslOK.Store(true)
+		// Forget sasl so girc never re-authenticates on a later CAP ACK.
+		c.RunHandlers(&girc.Event{Command: "CAP", Params: []string{"*", "DEL", "sasl"}})
+	})
 	c.Handlers.Add("005", func(_ *girc.Client, e girc.Event) {
-		// girc only parses ISUPPORT when its trailing parameter ends in
-		// "this server"; soju ends it in "are supported", so scan it ourselves.
+		// girc needs ISUPPORT to end in "this server"; soju ends in "are supported".
 		if v := filehostFromISupport(e); v != "" {
 			b.filehostURL.Store(v)
 			if b.cfg.Bot.Images.Enabled {

@@ -41,8 +41,7 @@ func imageTool() any {
 	}
 }
 
-// imagesToken prefers a dedicated Platform key; the ChatGPT OAuth flow cannot
-// generate images, so the shared key is only used with API-key auth.
+// imagesToken uses the dedicated Platform key, else the shared API key.
 func (a *AI) imagesToken(ctx context.Context) (string, error) {
 	if k := a.cfg.Bot.Images.APIKey; k != "" {
 		return k, nil
@@ -53,8 +52,7 @@ func (a *AI) imagesToken(ctx context.Context) (string, error) {
 	return "", errors.New("image generation requires a Platform API key (bot.images.api_key); the ChatGPT OAuth flow does not support image generation")
 }
 
-// generateImage requests one image and returns the decoded bytes. The model must
-// be an image-generation model; a text model does not emit images.
+// generateImage requests one image and returns its decoded bytes.
 func (a *AI) generateImage(ctx context.Context, prompt string) ([]byte, error) {
 	token, err := a.imagesToken(ctx)
 	if err != nil {
@@ -103,9 +101,7 @@ func (a *AI) generateImage(ctx context.Context, prompt string) ([]byte, error) {
 	return data, nil
 }
 
-// uploadCredentials returns the HTTP Basic credentials for the file host: the
-// SASL PLAIN pair when configured, otherwise the PASS credentials, so a soju
-// connection without SASL can still authenticate its uploads.
+// uploadCredentials returns the file host's HTTP Basic credentials.
 func (b *Bot) uploadCredentials() (string, string) {
 	if b.cfg.IRC.SASLUser != "" {
 		return b.cfg.IRC.SASLUser, b.cfg.IRC.SASLPassword
@@ -116,8 +112,7 @@ func (b *Bot) uploadCredentials() (string, string) {
 	return "", ""
 }
 
-// filehostFromISupport extracts a soju.im/FILEHOST or draft/FILEHOST value from
-// a 005 event. Ergo advertises draft/FILEHOST; soju advertises soju.im/FILEHOST.
+// filehostFromISupport extracts a FILEHOST value from a 005 event.
 func filehostFromISupport(e girc.Event) string {
 	for _, p := range e.Params {
 		name, val, ok := strings.Cut(p, "=")
@@ -128,9 +123,7 @@ func filehostFromISupport(e girc.Event) string {
 	return ""
 }
 
-// filehost uses the configured upload URL, else the advertised soju.im/FILEHOST.
-// The token is captured from 005 directly because girc drops ISUPPORT from
-// servers (such as soju) whose trailing parameter does not end in "this server".
+// filehost uses the configured upload URL, else the advertised one.
 func (b *Bot) filehost(c *girc.Client) string {
 	if b.cfg.Bot.Images.Filehost != "" {
 		return b.cfg.Bot.Images.Filehost
@@ -146,8 +139,7 @@ func (b *Bot) filehost(c *girc.Client) string {
 	return ""
 }
 
-// uploadImage POSTs the bytes per soju.im/FILEHOST: raw body, Basic auth from the
-// SASL PLAIN credentials, 201 + a Location resolved against the upload URL.
+// uploadImage POSTs the bytes to the file host and returns the stored URL.
 func (b *Bot) uploadImage(ctx context.Context, c *girc.Client, data []byte) (string, error) {
 	endpoint := b.filehost(c)
 	if endpoint == "" {

@@ -41,29 +41,10 @@ const presenceInstructions = `The IRC channel membership below is live state gat
 Users marked "away" may not read or answer promptly; prefer addressing members who are
 present. The snapshot can be incomplete or slightly stale.`
 
-// replyToolName is the function tool the model calls to thread its answer.
-const replyToolName = "reply"
-
-const replyInstructions = `You can mark your answer as a threaded reply to one earlier message with the %q tool.
-Call it with "msgid" set to the id of the message you are answering directly, when your
-answer is aimed at one person. If you are speaking to the channel as a whole, do not
-call it. Only use msgid values you actually saw. Threading is optional.`
-
-func replyTool() any {
-	return map[string]any{
-		"type":        "function",
-		"name":        replyToolName,
-		"description": "Mark this answer as a threaded reply to one earlier message.",
-		"parameters": map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"msgid": map[string]any{"type": "string", "description": "The [msgid:<id>] of the message being answered."},
-			},
-			"required":             []string{"msgid"},
-			"additionalProperties": false,
-		},
-	}
-}
+const replyInstructions = `If your answer is aimed at one person's message rather than the whole channel, start it with
+a reply marker: [[reply:<msgid>]] followed by the answer, using the id from that message's
+[msgid:<id>] prefix. Otherwise start directly with your answer. The marker only sets the
+thread target; it is not a substitute for the answer.`
 
 // redactToolName is the function tool the model calls to retract its own message.
 const redactToolName = "redact"
@@ -159,7 +140,7 @@ func (a *AI) instructions(opts replyOptions) string {
 		s += "\n\n" + fmt.Sprintf(imageInstructions, imageToolName, max)
 	}
 	if a.cfg.Bot.ReplyThreading == "model" && !opts.spontaneous {
-		s += "\n\n" + fmt.Sprintf(replyInstructions, replyToolName)
+		s += "\n\n" + replyInstructions
 	}
 	if opts.redact {
 		s += "\n\n" + fmt.Sprintf(redactInstructions, redactToolName)
@@ -208,9 +189,6 @@ func (a *AI) tools(opts replyOptions) []any {
 	// Image generation and reply threading are not offered on a silent check.
 	if a.cfg.Bot.Images.Enabled && !opts.spontaneous {
 		out = append(out, imageTool())
-	}
-	if a.cfg.Bot.ReplyThreading == "model" && !opts.spontaneous {
-		out = append(out, replyTool())
 	}
 	if opts.redact {
 		out = append(out, redactTool())

@@ -243,7 +243,7 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 	}
 	b.last = time.Now()
 	b.mu.Unlock()
-	slog.Info("answering", "channel", ch, "nick", e.Source.Name)
+	slog.Info("answering", "channel", ch, "nick", e.Source.Name, "message", logNote(msg))
 	snapshot := b.history.snapshot(ch)
 	b.requests.Add(1)
 	go func() {
@@ -275,20 +275,23 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 			c.Cmd.Message(ch, "Unable to answer: service unavailable or usage limit reached. Check the bot logs.")
 			return
 		}
-		b.applyReactions(c, ch, rep.Calls)
-		b.applyRedactions(c, ch, rep.Calls)
-		replyTo := ""
+		reactions := b.applyReactions(c, ch, rep.Calls)
+		redactions := b.applyRedactions(c, ch, rep.Calls)
+		replyTo, text := "", rep.Text
 		switch b.cfg.Bot.ReplyThreading {
 		case "always":
 			replyTo = msgid
 		case "model":
-			replyTo = b.replyTarget(ch, rep.Calls)
+			replyTo, text = b.threadedReply(ch, text)
 		}
-		lines := replyLines(rep.Text, b.cfg.Bot.MaxReplyLines)
+		lines := replyLines(text, b.cfg.Bot.MaxReplyLines)
 		lines = append(lines, b.applyImages(ctx, c, ch, rep.Calls)...)
 		if len(lines) == 0 {
-			if b.cfg.Bot.Images.Enabled && hasToolCall(rep.Calls, imageToolName) {
+			switch {
+			case b.cfg.Bot.Images.Enabled && hasToolCall(rep.Calls, imageToolName):
 				c.Cmd.Message(ch, "I couldn't generate that image. Check the bot logs.")
+			case reactions == 0 && redactions == 0:
+				slog.Warn("model produced no answer", "channel", ch, "tools", logTools(rep.Calls))
 			}
 			return
 		}
@@ -406,10 +409,10 @@ func (b *Bot) applyImages(ctx context.Context, c *girc.Client, ch string, calls 
 	return urls
 }
 
-// applyRedactions retracts one of the bot's own tracked messages.
-func (b *Bot) applyRedactions(c *girc.Client, ch string, calls []ToolCall) {
+// applyRedactions retracts one of the bot's own tracked messages, returning how many.
+func (b *Bot) applyRedactions(c *girc.Client, ch string, calls []ToolCall) int {
 	if !b.cfg.Bot.Redaction || b.own == nil || len(calls) == 0 {
-		return
+		return 0
 	}
 	for _, call := range calls {
 		if call.Name != redactToolName {
@@ -421,11 +424,11 @@ func (b *Bot) applyRedactions(c *girc.Client, ch string, calls []ToolCall) {
 		}
 		if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
 			slog.Warn("ignoring malformed redact arguments", "error", err)
-			return
+			return 0
 		}
 		if !b.own.has(ch, args.MsgID) {
 			slog.Warn("ignoring redact of unknown or foreign msgid", "msgid", args.MsgID)
-			return
+			return 0
 		}
 		raw := fmt.Sprintf("REDACT %s %s", ch, args.MsgID)
 		if reason := logNote(args.Reason); reason != "" {
@@ -433,12 +436,13 @@ func (b *Bot) applyRedactions(c *girc.Client, ch string, calls []ToolCall) {
 		}
 		if err := c.Cmd.SendRawNoSplit(raw); err != nil {
 			slog.Warn("redaction failed", "error", err)
-			return
+			return 0
 		}
 		slog.Info("redacted own message", "channel", ch, "msgid", args.MsgID, "reason", logNote(args.Reason))
 		b.history.add(ch, Message{Role: "assistant", Content: fmt.Sprintf("[redacted msgid=%s]", args.MsgID)})
-		return
+		return 1
 	}
+	return 0
 }
 
 func hasToolCall(calls []ToolCall, name string) bool {
@@ -450,25 +454,33 @@ func hasToolCall(calls []ToolCall, name string) bool {
 	return false
 }
 
-// replyTarget returns the msgid to thread the answer to, or "" for the channel.
-func (b *Bot) replyTarget(ch string, calls []ToolCall) string {
-	for _, call := range calls {
-		if call.Name != replyToolName {
-			continue
-		}
-		var args struct {
-			MsgID string `json:"msgid"`
-		}
-		if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
-			slog.Warn("ignoring malformed reply arguments", "error", err)
-			continue
-		}
-		if b.history.hasMsgID(ch, args.MsgID) {
-			return args.MsgID
-		}
-		slog.Warn("ignoring reply to unknown msgid", "msgid", args.MsgID)
+// threadedReply extracts a leading [[reply:<msgid>]] marker from the answer,
+// returning the target id (only if seen in this channel) and the answer text.
+func (b *Bot) threadedReply(ch, text string) (string, string) {
+	s := strings.TrimSpace(text)
+	const prefix = "[[reply:"
+	if !strings.HasPrefix(s, prefix) {
+		return "", text
 	}
-	return ""
+	end := strings.Index(s, "]]")
+	if end < len(prefix) {
+		return "", text
+	}
+	id := strings.TrimSpace(s[len(prefix):end])
+	rest := strings.TrimSpace(s[end+2:])
+	if rest == "" || !b.history.hasMsgID(ch, id) {
+		return "", text
+	}
+	return id, rest
+}
+
+// logTools returns the model's tool-call names for logging.
+func logTools(calls []ToolCall) string {
+	names := make([]string, 0, len(calls))
+	for _, c := range calls {
+		names = append(names, c.Name)
+	}
+	return strings.Join(names, ",")
 }
 
 // setTyping emits the client-only "+typing" tag.
@@ -701,6 +713,11 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 			"echo-message", c.HasCapability("echo-message"),
 			"message-redaction", c.HasCapability("draft/message-redaction"),
 		)
+		if b.cfg.Bot.Redaction && (!c.HasCapability("echo-message") || !c.HasCapability("draft/message-redaction")) {
+			slog.Warn("redaction enabled but the server did not negotiate draft/message-redaction",
+				"echo-message", c.HasCapability("echo-message"),
+				"message-redaction", c.HasCapability("draft/message-redaction"))
+		}
 		updateReady()
 		for _, ch := range b.cfg.IRC.Channels {
 			c.Cmd.Join(ch)

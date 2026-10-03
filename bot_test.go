@@ -1263,8 +1263,26 @@ func TestIRCImageNoFilehost(t *testing.T) {
 	}
 }
 
-func TestIRCReplyTool(t *testing.T) {
-	// In "model" mode the answer is threaded only when the model asks for it.
+func TestThreadedReply(t *testing.T) {
+	h, _ := newHistory("", 10)
+	h.add("#a", Message{Role: "user", Content: "hi", MsgID: "m1"})
+	b := &Bot{history: h}
+	if id, text := b.threadedReply("#a", "[[reply:m1]] hello"); id != "m1" || text != "hello" {
+		t.Fatal(id, text)
+	}
+	if id, text := b.threadedReply("#a", "hello"); id != "" || text != "hello" {
+		t.Fatal(id, text)
+	}
+	if id, _ := b.threadedReply("#a", "[[reply:zzz]] hello"); id != "" {
+		t.Fatal("unknown msgid must be ignored", id)
+	}
+	if id, text := b.threadedReply("#a", "[[reply:m1]]"); id != "" || text != "[[reply:m1]]" {
+		t.Fatal("marker without an answer must be left intact", id, text)
+	}
+}
+
+func TestIRCReplyMarker(t *testing.T) {
+	// In "model" mode the answer is threaded only when it carries a reply marker.
 	listener, e := net.Listen("tcp", "127.0.0.1:0")
 	if e != nil {
 		t.Fatal(e)
@@ -1273,7 +1291,7 @@ func TestIRCReplyTool(t *testing.T) {
 	var calls atomic.Int32
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {
-			fmt.Fprint(w, sseToolCall("hi alice", replyToolName, `{"msgid":"m1"}`, "c1"))
+			fmt.Fprint(w, sse("[[reply:m1]] hi alice"))
 			return
 		}
 		fmt.Fprint(w, sse("hi everyone"))
@@ -1343,7 +1361,7 @@ func TestIRCReplyTool(t *testing.T) {
 	if !b.ready.Load() {
 		t.Fatal("not ready after JOIN")
 	}
-	// Model asks to thread: the answer carries +reply.
+	// A [[reply:<msgid>]] marker threads the answer and is stripped.
 	send("@account=alice;msgid=m1 :Alice!u@h PRIVMSG #chat :@Kat hi")
 	got := until("PRIVMSG #chat")
 	if !strings.Contains(got, "@+reply=m1 ") || !strings.Contains(got, "hi alice") {
@@ -1353,7 +1371,7 @@ func TestIRCReplyTool(t *testing.T) {
 	for b.busy.Load() && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	// Model stays silent about threading: the answer addresses the channel.
+	// Without a marker the answer addresses the channel.
 	send("@account=alice;msgid=m2 :Alice!u@h PRIVMSG #chat :@Kat hi all")
 	got2 := until("PRIVMSG #chat")
 	if strings.Contains(got2, "+reply") || !strings.Contains(got2, "hi everyone") {

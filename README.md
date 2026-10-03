@@ -13,12 +13,13 @@ MIT licensed. No personal profile or deployment-specific configuration is bundle
   message tags and batches. Supports SASL PLAIN. Ignores playback batches and
   messages timestamped before the current connection.
 - Threading is controlled by `bot.reply_threading`. With `model` (the default)
-  the model may mark an answer as an IRCv3 reply (`+reply`) to one earlier
-  message when it is answering a specific person, and otherwise addresses the
-  channel as a whole. `always` threads every answer to the triggering message;
-  `never` disables threading. Clients that render replies (for example goguma)
-  show the question inline. With `bot.typing`, it also sends `+typing=active`
-  while generating and `+typing=done` once the answer starts.
+  the model may prefix an answer with `[[reply:<msgid>]]` to mark it as an IRCv3
+  reply (`+reply`) to one earlier message when answering a specific person; the
+  marker is stripped before posting. Otherwise the answer addresses the channel.
+  `always` threads every answer to the triggering message; `never` disables
+  threading. Clients that render replies (for example goguma) show the question
+  inline. With `bot.typing`, it also sends `+typing=active` while generating and
+  `+typing=done` once the answer starts.
 - Keeps a bounded conversation history per channel. Ordinary channel messages
   become context; only addressed messages cause inference. `allowed_accounts`
   restricts inference to authenticated IRC accounts, not nicknames. It does not

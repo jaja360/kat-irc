@@ -7,8 +7,9 @@ MIT licensed. No personal profile or deployment-specific configuration is bundle
 ## Behavior
 
 - Answers channel messages beginning with its nick followed by `:` or `@nick`
-  followed by whitespace/end of message. With nick `Kat`: `Kat: hello`, `Kat:hello`,
-  and `@Kat hello` work. Mid-sentence mentions, DMs and CTCP do not trigger replies.
+  followed by a non-nick character (whitespace or punctuation) or the end of the
+  message. With nick `Kat`: `Kat: hello`, `Kat:hello`, `@Kat hello`, `@Kat:` and
+  `@Kat, hi` work. Mid-sentence mentions, DMs and CTCP do not trigger replies.
 - Negotiates IRCv3 capabilities with girc, including account tags, server time,
   message tags and batches. Supports SASL PLAIN. Ignores playback batches and
   messages timestamped before the current connection.

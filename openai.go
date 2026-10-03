@@ -30,11 +30,11 @@ Rules:
 - Reacting is optional: if nothing is worth a reaction, do not call the tool.
 - The reason is a private one-sentence note; it is never sent to IRC.`
 
-const spontaneousOnlyInstructions = `This is a silent reaction check, not an invitation to chat: any text you produce is
-discarded and never sent to the channel, so do not write a chat reply.
-Call the %q tool only if a reaction is warranted. If nothing deserves a reaction, do
-not call the tool, and explain why in one short sentence (that note only appears in the
-bot's logs).`
+const spontaneousOnlyInstructions = `This is a silent reaction check: any text you produce is discarded and never sent.
+Call the %q tool when a reaction would fit — a message that is funny, kind, surprising, or
+simply worth acknowledging usually deserves one. Prefer reacting unless the message is
+purely logistical. If nothing warrants a reaction, do not call the tool and say why in one
+short sentence (logs only).`
 
 // presenceInstructions heads the live channel-membership snapshot.
 const presenceInstructions = `The IRC channel membership below is live state gathered from the server, not chat.

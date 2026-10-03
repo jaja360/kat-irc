@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/lrstanley/girc"
 )
@@ -19,9 +20,10 @@ const imageToolName = "image"
 
 const imageInstructions = `You can generate an image with the %q tool.
 Call it with a short, self-contained "prompt" describing the image. Kat generates
-it, uploads it and posts the resulting URL to the channel. Use it only when an
-image genuinely helps the conversation, at most %d image(s) per answer. The image
-is public to everyone who can see the channel.`
+it, uploads it and posts the resulting URL to the channel. Call it only when the
+user asks for an image (or one is clearly required); never for ordinary chat. At
+most %d image(s) per answer. The image is public to everyone who can see the
+channel.`
 
 func imageTool() any {
 	return map[string]any{
@@ -101,13 +103,32 @@ func (a *AI) generateImage(ctx context.Context, prompt string) ([]byte, error) {
 	return data, nil
 }
 
-// filehost uses the configured upload URL, else the soju.im/FILEHOST token.
+// filehostFromISupport extracts a soju.im/FILEHOST or draft/FILEHOST value from
+// a 005 event. Ergo advertises draft/FILEHOST; soju advertises soju.im/FILEHOST.
+func filehostFromISupport(e girc.Event) string {
+	for _, p := range e.Params {
+		name, val, ok := strings.Cut(p, "=")
+		if ok && val != "" && (name == "soju.im/FILEHOST" || name == "draft/FILEHOST") {
+			return val
+		}
+	}
+	return ""
+}
+
+// filehost uses the configured upload URL, else the advertised soju.im/FILEHOST.
+// The token is captured from 005 directly because girc drops ISUPPORT from
+// servers (such as soju) whose trailing parameter does not end in "this server".
 func (b *Bot) filehost(c *girc.Client) string {
 	if b.cfg.Bot.Images.Filehost != "" {
 		return b.cfg.Bot.Images.Filehost
 	}
-	if v, ok := c.GetServerOption("soju.im/FILEHOST"); ok {
+	if v, ok := b.filehostURL.Load().(string); ok {
 		return v
+	}
+	for _, key := range []string{"soju.im/FILEHOST", "draft/FILEHOST"} {
+		if v, ok := c.GetServerOption(key); ok {
+			return v
+		}
 	}
 	return ""
 }

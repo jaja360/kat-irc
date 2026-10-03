@@ -160,7 +160,18 @@ func serve(parent context.Context, path, health string, interval time.Duration) 
 				}
 			}
 		}()
-		slog.Info("IRC bot starting", "auth", b.cfg.OpenAI.Auth, "model", b.cfg.OpenAI.Model, "tls", b.cfg.IRC.TLS)
+		slog.Info("IRC bot starting",
+			"auth", b.cfg.OpenAI.Auth,
+			"model", b.cfg.OpenAI.Model,
+			"tls", b.cfg.IRC.TLS,
+			"typing", b.cfg.Bot.Typing,
+			"presence", b.cfg.Bot.Presence,
+			"reply_threading", b.cfg.Bot.ReplyThreading,
+			"reactions", b.cfg.Bot.Reactions.Enabled,
+			"images", b.cfg.Bot.Images.Enabled,
+			"image_model", b.cfg.Bot.Images.Model,
+			"redaction", b.cfg.Bot.Redaction,
+		)
 		err = b.run(ctx)
 		cancel()
 		<-saved

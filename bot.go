@@ -110,17 +110,18 @@ func replyLines(s string, limit int) []string {
 }
 
 type Bot struct {
-	cfg       Config
-	ai        *AI
-	history   *History
-	own       *ownMessages
-	ready     atomic.Bool
-	busy      atomic.Bool
-	reacting  atomic.Bool
-	mu        sync.Mutex
-	last      time.Time
-	lastReact time.Time
-	requests  sync.WaitGroup
+	cfg         Config
+	ai          *AI
+	history     *History
+	own         *ownMessages
+	filehostURL atomic.Value // string, from the 005 soju.im/FILEHOST token
+	ready       atomic.Bool
+	busy        atomic.Bool
+	reacting    atomic.Bool
+	mu          sync.Mutex
+	last        time.Time
+	lastReact   time.Time
+	requests    sync.WaitGroup
 }
 
 // ownMessages tracks the msgids of the bot's own recent messages per channel,
@@ -242,6 +243,7 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 	}
 	b.last = time.Now()
 	b.mu.Unlock()
+	slog.Info("answering", "channel", ch, "nick", e.Source.Name)
 	snapshot := b.history.snapshot(ch)
 	b.requests.Add(1)
 	go func() {
@@ -285,6 +287,9 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 		lines := replyLines(rep.Text, b.cfg.Bot.MaxReplyLines)
 		lines = append(lines, b.applyImages(ctx, c, ch, rep.Calls)...)
 		if len(lines) == 0 {
+			if b.cfg.Bot.Images.Enabled && hasToolCall(rep.Calls, imageToolName) {
+				c.Cmd.Message(ch, "I couldn't generate that image. Check the bot logs.")
+			}
 			return
 		}
 		// Clear the indicator as the answer starts, matching client behavior.
@@ -386,6 +391,7 @@ func (b *Bot) applyImages(ctx context.Context, c *girc.Client, ch string, calls 
 			slog.Warn("ignoring invalid image prompt")
 			continue
 		}
+		slog.Info("generating image", "channel", ch, "prompt", logNote(prompt))
 		imgCtx, cancel := context.WithTimeout(ctx, time.Duration(b.cfg.Bot.Images.TimeoutSeconds)*time.Second)
 		data, err := b.ai.generateImage(imgCtx, prompt)
 		if err == nil {
@@ -437,6 +443,15 @@ func (b *Bot) applyRedactions(c *girc.Client, ch string, calls []ToolCall) {
 		b.history.add(ch, Message{Role: "assistant", Content: fmt.Sprintf("[redacted msgid=%s]", args.MsgID)})
 		return
 	}
+}
+
+func hasToolCall(calls []ToolCall, name string) bool {
+	for _, call := range calls {
+		if call.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // replyTarget returns the msgid the model chose to thread its answer to, or ""
@@ -648,10 +663,25 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 	updateReady := func() {
 		n := 0
 		joined.Range(func(_, _ any) bool { n++; return true })
-		b.ready.Store(registered.Load() && n == len(b.cfg.IRC.Channels))
+		wasReady := b.ready.Load()
+		nowReady := registered.Load() && n == len(b.cfg.IRC.Channels)
+		b.ready.Store(nowReady)
+		if nowReady && !wasReady && b.cfg.Bot.Images.Enabled && b.filehost(c) == "" {
+			slog.Warn("images enabled but no upload host; set images.filehost or advertise soju.im/FILEHOST/draft/FILEHOST")
+		}
 	}
 	started := time.Now()
 	c.Handlers.Add("903", func(_ *girc.Client, _ girc.Event) { saslOK.Store(true) })
+	c.Handlers.Add("005", func(_ *girc.Client, e girc.Event) {
+		// girc only parses ISUPPORT when its trailing parameter ends in
+		// "this server"; soju ends it in "are supported", so scan it ourselves.
+		if v := filehostFromISupport(e); v != "" {
+			b.filehostURL.Store(v)
+			if b.cfg.Bot.Images.Enabled {
+				slog.Info("image upload host advertised", "filehost", v)
+			}
+		}
+	})
 	c.Handlers.Add(girc.CONNECTED, func(c *girc.Client, e girc.Event) {
 		if ctx.Err() != nil {
 			return
@@ -672,6 +702,12 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 			return
 		}
 		registered.Store(true)
+		slog.Info("connected", "server", b.cfg.IRC.Server,
+			"message-tags", c.HasCapability("message-tags"),
+			"account-tag", c.HasCapability("account-tag"),
+			"echo-message", c.HasCapability("echo-message"),
+			"message-redaction", c.HasCapability("draft/message-redaction"),
+		)
 		updateReady()
 		for _, ch := range b.cfg.IRC.Channels {
 			c.Cmd.Join(ch)

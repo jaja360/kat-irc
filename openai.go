@@ -210,6 +210,9 @@ func (a *AI) reply(ctx context.Context, messages []Message, opts replyOptions) (
 	}
 	if tools := a.tools(opts); len(tools) > 0 {
 		body["tools"] = tools
+		if opts.spontaneous && a.cfg.Bot.Reactions.Force {
+			body["tool_choice"] = map[string]any{"type": "function", "name": reactToolName}
+		}
 	}
 	b, e := json.Marshal(body)
 	if e != nil {

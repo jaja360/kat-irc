@@ -180,6 +180,41 @@ func TestOpenAIRequest(t *testing.T) {
 	}
 }
 
+func TestSpontaneousToolChoice(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if e := json.NewDecoder(r.Body).Decode(&body); e != nil {
+			t.Error(e)
+		}
+		fmt.Fprint(w, sse(""))
+	}))
+	defer server.Close()
+	var c Config
+	c.OpenAI.Auth = "api_key"
+	c.OpenAI.APIKey = "test-key"
+	c.OpenAI.Model = "test"
+	c.OpenAI.MaxOutputTokens = 100
+	c.Bot.Persona = "test"
+	c.Bot.Reactions.Enabled = true
+	c.Bot.Reactions.MaxPerReply = 2
+	a := &AI{cfg: c, http: server.Client(), endpoint: server.URL}
+	if _, e := a.reply(context.Background(), []Message{{Role: "user", Content: "hi"}}, replyOptions{spontaneous: true}); e != nil {
+		t.Fatal(e)
+	}
+	if _, ok := body["tool_choice"]; ok {
+		t.Fatal("tool_choice must not be set without force")
+	}
+	c.Bot.Reactions.Force = true
+	a = &AI{cfg: c, http: server.Client(), endpoint: server.URL}
+	if _, e := a.reply(context.Background(), []Message{{Role: "user", Content: "hi"}}, replyOptions{spontaneous: true}); e != nil {
+		t.Fatal(e)
+	}
+	if _, ok := body["tool_choice"]; !ok {
+		t.Fatal("tool_choice must be set with force")
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

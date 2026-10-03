@@ -332,6 +332,7 @@ func (b *Bot) applyReactions(c *girc.Client, ch string, calls []ToolCall) int {
 	}
 	max := b.cfg.Bot.Reactions.MaxPerReply
 	sent := 0
+	seen := map[string]bool{}
 	for _, call := range calls {
 		if sent >= max {
 			break
@@ -353,10 +354,14 @@ func (b *Bot) applyReactions(c *girc.Client, ch string, calls []ToolCall) int {
 			slog.Warn("ignoring invalid reaction emoji", "emoji", args.Emoji)
 			continue
 		}
+		if seen[args.MsgID] {
+			continue
+		}
 		if !b.history.hasMsgID(ch, args.MsgID) {
 			slog.Warn("ignoring reaction to unknown msgid", "msgid", args.MsgID)
 			continue
 		}
+		seen[args.MsgID] = true
 		raw := fmt.Sprintf("@+draft/react=%s;+reply=%s TAGMSG %s", escapeTagValue(emoji), escapeTagValue(args.MsgID), ch)
 		if err := c.Cmd.SendRawNoSplit(raw); err != nil {
 			slog.Warn("sending reaction failed", "error", err)

@@ -163,6 +163,7 @@ resolve beside the configuration file. The container reads `/data/config.json`.
 | `bot.allowed_accounts` | Optional IRC account allowlist; empty allows everyone in configured channels |
 | `bot.reactions.enabled` | Offer the `react` tool, handle incoming reactions; off unless set |
 | `bot.reactions.spontaneous` | Also evaluate ordinary messages for a reaction; requires `enabled` |
+| `bot.reactions.force` | Require a reaction on each spontaneous check instead of letting the model decline |
 | `bot.reactions.min_interval_seconds` | Minimum gap between spontaneous evaluations (default 180, minimum 15) |
 | `bot.reactions.max_per_reply` | Reactions emitted per model answer, 1–5 (default 2) |
 | `bot.images.enabled` | Offer the `image` tool: generate, upload and post an image URL; off unless set |

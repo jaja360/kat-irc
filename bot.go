@@ -18,19 +18,27 @@ import (
 	"github.com/lrstanley/girc"
 )
 
-// The trigger must start at byte 0. @Katastrophe and mid-sentence mentions don't match.
+// triggered reports whether s addresses the bot: "nick:" at the start, or "@nick"
+// followed by the end of the message or a non-nick character (whitespace or
+// punctuation). @Katastrophe and mid-sentence mentions do not match.
 func triggered(s, nick string) bool {
-	for _, p := range []string{nick + ":", "@" + nick} {
-		if len(s) < len(p) || !strings.EqualFold(s[:len(p)], p) {
-			continue
-		}
-		if p[0] != '@' || len(s) == len(p) {
-			return true
-		}
-		r, _ := utf8.DecodeRuneInString(s[len(p):])
-		return unicode.IsSpace(r)
+	if len(s) > len(nick) && s[len(nick)] == ':' && strings.EqualFold(s[:len(nick)], nick) {
+		return true
 	}
-	return false
+	p := "@" + nick
+	if len(s) < len(p) || !strings.EqualFold(s[:len(p)], p) {
+		return false
+	}
+	if len(s) == len(p) {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(s[len(p):])
+	return !isNickRune(r)
+}
+
+// isNickRune reports whether r can appear in an IRC nickname.
+func isNickRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || strings.ContainsRune("[]\\`_^{|}-", r)
 }
 
 // validReaction accepts a short, single-token emoji suitable for an IRCv3 tag.

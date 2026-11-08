@@ -18,6 +18,7 @@
     "api_key": "",
     "model": "gpt-6-luna",
     "reasoning_effort": "low",
+    "web_search": false,
     "credentials_file": "oauth.json",
     "timeout_seconds": 60,
     "max_output_tokens": 1000

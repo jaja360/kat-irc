@@ -83,8 +83,9 @@ type ToolCall struct {
 	Arguments string
 }
 type Reply struct {
-	Text  string
-	Calls []ToolCall
+	Text    string
+	Calls   []ToolCall
+	Sources []webSource
 }
 type replyOptions struct {
 	// spontaneous marks a "react or stay silent" evaluation: no text, and an
@@ -127,6 +128,13 @@ func (a *AI) token(ctx context.Context) (string, error) {
 // instructions is the persona plus the enabled tool contracts and presence.
 func (a *AI) instructions(opts replyOptions) string {
 	s := a.cfg.Bot.Persona
+	if !opts.spontaneous {
+		if a.cfg.OpenAI.WebSearch {
+			s += "\n\n" + webSearchInstructions + "\nCurrent UTC date: " + time.Now().UTC().Format("2006-01-02")
+		} else {
+			s += "\n\nWeb search is disabled for this request. Use your general knowledge for stable facts. Mention lack of live access only when current verification is necessary; do not use it as a blanket refusal."
+		}
+	}
 	if a.cfg.Bot.Reactions.Enabled {
 		if opts.spontaneous {
 			s += "\n\n" + spontaneousOnlyInstructions
@@ -171,6 +179,9 @@ func (a *AI) wireInput(messages []Message) []Message {
 }
 func (a *AI) tools(opts replyOptions) []any {
 	var out []any
+	if a.cfg.OpenAI.WebSearch && !opts.spontaneous {
+		out = append(out, map[string]any{"type": "web_search"})
+	}
 	// A silent check returns an emoji as text, not a tool call.
 	if a.cfg.Bot.Reactions.Enabled && !opts.spontaneous {
 		out = append(out, map[string]any{
@@ -250,6 +261,7 @@ func consumeSSE(r io.Reader) (Reply, error) {
 	s.Buffer(make([]byte, 4096), 2<<20)
 	var text strings.Builder
 	var data []string
+	var finalOutput []responseOutput
 
 	type call struct {
 		name   string
@@ -287,7 +299,10 @@ func consumeSSE(r io.Reader) (Reply, error) {
 			return false, nil
 		}
 		var ev struct {
-			Type      string `json:"type"`
+			Type     string `json:"type"`
+			Response *struct {
+				Output []responseOutput `json:"output"`
+			} `json:"response"`
 			Delta     string `json:"delta"`
 			ItemID    string `json:"item_id"`
 			Arguments string `json:"arguments"`
@@ -337,6 +352,9 @@ func consumeSSE(r io.Reader) (Reply, error) {
 			c.partial.Reset()
 			c.final = ev.Arguments
 		case "response.completed":
+			if ev.Response != nil {
+				finalOutput = ev.Response.Output
+			}
 			return true, nil
 		case "response.failed", "response.incomplete", "error":
 			return false, fmt.Errorf("OpenAI stream ended with %s", ev.Type)
@@ -352,6 +370,15 @@ func consumeSSE(r io.Reader) (Reply, error) {
 			}
 			if done {
 				out := Reply{Text: strings.TrimSpace(text.String())}
+				if finalOutput != nil {
+					rendered, sources, err := renderWebOutput(finalOutput)
+					if err != nil {
+						return Reply{}, err
+					}
+					if rendered != "" {
+						out.Text, out.Sources = rendered, sources
+					}
+				}
 				for _, key := range order {
 					c := calls[key]
 					if c == nil || c.name == "" {

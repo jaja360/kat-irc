@@ -152,6 +152,7 @@ resolve beside the configuration file. The container reads `/data/config.json`.
 | `openai.auth` | Exactly `chatgpt` or `api_key` |
 | `openai.api_key`, `openai.credentials_file` | Private key or OAuth file location |
 | `openai.model`, `openai.reasoning_effort` | Model and optional supported reasoning setting |
+| `openai.web_search` | Offer hosted Web search for normal answers; off by default, never offered for spontaneous reaction checks |
 | `openai.timeout_seconds` | Whole inference timeout, including credential refresh |
 | `openai.max_output_tokens` | API-key output budget; omitted for direct ChatGPT OAuth |
 | `bot.persona`, `bot.persona_file`, `bot.memory_file` | Inline instructions plus optional external files |
@@ -253,10 +254,66 @@ missing. Guardrails:
 - soju passes `draft/message-redaction` through only when the upstream network
   supports it, so the tool may simply be unavailable on some networks.
 
-The sample selects `gpt-6-luna` with low reasoning effort as a starting point for
-short conversational replies. Confirm availability using `models` in OAuth mode;
-edit the configuration if the account exposes different identifiers. A persona
-influences tone; it cannot guarantee identical behavior across models.
+## Web search
+
+Set `openai.web_search` to `true` in the private configuration file and restart
+`serve`. This offers the hosted Responses `web_search` tool alongside the
+existing tools. The model chooses when to search; this is not an unconditional
+search for every message. Instructions encourage search for explicit requests,
+current facts and uncertain factual questions. Spontaneous emoji checks never
+receive this tool. The bot supplies the current UTC date on search-enabled turns.
+
+Search can be available with either API-key auth or direct ChatGPT OAuth,
+subject to the selected model and account/workspace policy. Check the current
+[OpenAI direct-flow limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations).
+Enabling the option does not establish account eligibility. Rejected requests
+produce the normal service error; no API billing fallback or paid retry is made.
+API-key search can incur tool-call and retrieved-token charges in addition to
+inference. ChatGPT OAuth uses the account's plan limits.
+
+Completed response annotations are converted to numbered references and
+clickable source URLs in IRC. URL lines share `max_reply_lines` with the answer;
+room is reserved for all cited URLs even if the answer is shortened. If the
+sources cannot fit or a URL cannot be displayed safely in a single IRC line,
+the bot returns an error instead of silently removing attribution. Search does
+not download or execute arbitrary pages inside the pod. Queries are handled by
+the hosted search service; avoid putting private information in public searches.
+
+## Answer depth and model choice
+
+The sample uses `gpt-6-luna` with low reasoning effort for short replies. For
+more developed discussion, try `medium` reasoning, a persona that asks for
+explanations when useful, and a larger transport budget. For example, merge
+these settings into your existing configuration (preserving your auth and other
+fields):
+
+```json
+{
+  "openai": {
+    "reasoning_effort": "medium",
+    "timeout_seconds": 120,
+    "max_output_tokens": 4096,
+    "web_search": true
+  },
+  "bot": { "max_reply_lines": 16 }
+}
+```
+
+`max_reply_lines` is a hard output cap, not a request to fill every line. Six
+lines carry at most roughly 2,100 UTF-8 bytes of answer text before truncation;
+UTF-8 bytes are not model tokens. Higher line counts also take longer to send
+because the bot spaces lines to reduce flooding. Up to 20 lines are supported.
+`max_output_tokens` is an API-key generation budget, including reasoning tokens;
+it is intentionally omitted for ChatGPT OAuth. A higher reasoning effort can
+increase latency and quota consumption. No exact response-time improvement is
+guaranteed by a model change.
+
+`gpt-6.1-terra` is another option to compare for writing quality; list the models
+available to your account with `models` before changing `openai.model`. Model
+availability, context limits and pricing are account/route dependent. A larger
+context window does not by itself make answers deeper. Keep persona and memory
+focused; they are supplied again with each request. OpenAI documents a 128k
+search context limit even for models with larger native context windows.
 
 To load your own persona and memory, set `bot.persona_file` to `persona.md` and
 `bot.memory_file` to `memory.md`, then create those files next to `config.json`.

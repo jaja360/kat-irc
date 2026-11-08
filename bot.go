@@ -684,10 +684,16 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 	var registered atomic.Bool
 	var joined sync.Map
 	updateReady := func() {
-		n := 0
-		joined.Range(func(_, _ any) bool { n++; return true })
+		// Ready means every configured channel is joined; extra ones don't count.
+		all := true
+		for _, ch := range b.cfg.IRC.Channels {
+			if _, ok := joined.Load(girc.ToRFC1459(ch)); !ok {
+				all = false
+				break
+			}
+		}
 		wasReady := b.ready.Load()
-		nowReady := registered.Load() && n == len(b.cfg.IRC.Channels)
+		nowReady := registered.Load() && all
 		b.ready.Store(nowReady)
 		if nowReady && !wasReady && b.cfg.Bot.Images.Enabled && b.filehost(c) == "" {
 			slog.Warn("images enabled but no upload host; set images.filehost or advertise soju.im/FILEHOST/draft/FILEHOST")
@@ -751,7 +757,14 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 	})
 	c.Handlers.Add(girc.JOIN, func(c *girc.Client, e girc.Event) {
 		if e.Source != nil && strings.EqualFold(e.Source.Name, c.GetNick()) && len(e.Params) > 0 {
-			joined.Store(girc.ToRFC1459(e.Params[0]), true)
+			ch := e.Params[0]
+			if b.allowedChannel(ch) == "" {
+				// Servers and bouncers attach channels we never asked for: leave them.
+				slog.Info("leaving unconfigured channel", "channel", ch)
+				c.Cmd.PartMessage(ch, "not configured")
+				return
+			}
+			joined.Store(girc.ToRFC1459(ch), true)
 			updateReady()
 		}
 	})
@@ -767,6 +780,9 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 		if e.Source != nil && strings.EqualFold(e.Source.Name, c.GetNick()) && len(e.Params) > 0 {
 			joined.Delete(girc.ToRFC1459(e.Params[0]))
 			updateReady()
+			if b.allowedChannel(e.Params[0]) == "" {
+				return
+			}
 			go c.Close()
 		}
 	})

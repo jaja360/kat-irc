@@ -146,7 +146,7 @@ resolve beside the configuration file. The container reads `/data/config.json`.
 | --- | --- |
 | `irc.server`, `irc.port` | Arbitrary IRC hostname/IP and port; no server is hardcoded |
 | `irc.multiline` | `auto` (default) negotiates native multiline and server limits; `off` forces plain messages |
-| `irc.nick`, `irc.channels` | Bot identity, trigger prefix and channels to join |
+| `irc.nick`, `irc.channels` | Bot identity, trigger prefix and channels to join; any other channel is left |
 | `irc.tls` | Enable certificate-verified TLS, minimum TLS 1.2 |
 | `irc.server_name`, `irc.ca_file` | Optional TLS name override and custom CA |
 | `irc.password` | Optional IRC server password; fallback `IRC_PASSWORD` |

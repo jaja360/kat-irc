@@ -292,7 +292,12 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 		case "model":
 			replyTo, text = b.threadedReply(ch, text)
 		}
-		lines := replyLines(text, b.cfg.Bot.MaxReplyLines)
+		lines, lineErr := sourcedReplyLines(text, rep.Sources, b.cfg.Bot.MaxReplyLines)
+		if lineErr != nil {
+			slog.Warn("cannot display web citations", "error", lineErr)
+			c.Cmd.Message(ch, "Unable to display this answer with its sources. Please ask a narrower question.")
+			return
+		}
 		lines = append(lines, b.applyImages(ctx, c, ch, rep.Calls)...)
 		if len(lines) == 0 {
 			switch {

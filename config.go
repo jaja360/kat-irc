@@ -32,6 +32,7 @@ type Config struct {
 		APIKey          string `json:"api_key"`
 		Model           string `json:"model"`
 		ReasoningEffort string `json:"reasoning_effort"`
+		WebSearch       bool   `json:"web_search"`
 		CredentialsFile string `json:"credentials_file"`
 		TimeoutSeconds  int    `json:"timeout_seconds"`
 		MaxOutputTokens int    `json:"max_output_tokens"`

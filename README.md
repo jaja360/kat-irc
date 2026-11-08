@@ -22,7 +22,8 @@ MIT licensed. No personal profile or deployment-specific configuration is bundle
   inline. With `bot.typing`, it also sends `+typing=active` while generating and
   `+typing=done` once the answer starts.
 - Keeps a bounded conversation history per channel. Ordinary channel messages
-  become context; only addressed messages cause inference. `allowed_accounts`
+  become context; addressed messages cause conversational inference. Optional
+  reactions and channel-memory maintenance can also cause inference. `allowed_accounts`
   restricts inference to authenticated IRC accounts, not nicknames. It does not
   exclude other participants' messages from context.
 - Sees IRCv3 reactions: incoming `TAGMSG` with `+draft/react` and a `+reply`
@@ -55,7 +56,7 @@ MIT licensed. No personal profile or deployment-specific configuration is bundle
   image with a separate OpenAI image model, upload the bytes to the server's
   `soju.im/FILEHOST` HTTP upload host, and post the resulting URL. The image is
   produced by the configured image model, not by the chat model.
-- Makes one inference request at a time, with a cooldown and timeout. IRC PING
+- Makes one conversational inference request at a time, with a cooldown and timeout. IRC PING
   handling remains active while inference runs. Replies are sanitized and split
   into bounded UTF-8 lines. Failed/incomplete streams are not posted as answers.
 - Reconnects to IRC with backoff. Credentials, persona and memory never need to
@@ -91,7 +92,9 @@ needs no restart. Use one running instance per configuration/data directory.
 
 `check` validates configuration and referenced persona/memory files without a
 network request. `models` requires configured credentials and lists the account's
-available model identifiers. No automatic inference is performed at startup.
+available model identifiers. No inference is performed merely to validate setup.
+If channel memory is enabled, its background maintenance can process retained
+history after startup, according to its normal thresholds.
 
 ## Authentication
 
@@ -172,6 +175,7 @@ resolve beside the configuration file. The container reads `/data/config.json`.
 | `bot.images.filehost` | Optional upload URL override; otherwise discovered from `soju.im/FILEHOST` |
 | `bot.images.max_per_reply` | Images generated per model answer, 1–2 (default 1) |
 | `bot.images.timeout_seconds` | Timeout for generation plus upload (default 120) |
+| `bot.channel_memory` | Optional bounded, selective long-term memory learned from each channel; see below |
 | `bot.redaction` | Offer the `redact` tool so the model can retract its own messages; off unless set |
 
 ### Reactions
@@ -317,14 +321,112 @@ search context limit even for models with larger native context windows.
 
 To load your own persona and memory, set `bot.persona_file` to `persona.md` and
 `bot.memory_file` to `memory.md`, then create those files next to `config.json`.
-Long-term memory is operator-maintained text; the bot does not automatically write
-new facts into it. Recent conversation is saved separately in `history.json`.
+The pre-existing `memory.md` remains operator-maintained text. Optional learned
+channel memory is separate; the bot never edits `persona.md` or `memory.md`.
+Recent conversation is saved separately in `history.json`.
 ChatGPT's saved memories and custom instructions are not imported by OAuth.
 
 Persona, memory and the current channel history are sent to OpenAI for each
 answer. Keeping them out of Git protects repository privacy, but does not make
 prompt contents inaccessible to channel participants through model answers.
 Only supply material appropriate for the channels in which the bot runs.
+
+## Selective long-term channel memory
+
+Three layers can be supplied to a normal answer:
+
+| Layer | File | Writer |
+| --- | --- | --- |
+| Persona and pre-existing long-term knowledge | `persona.md`, `memory.md` | Operator |
+| Learned, selective long-term channel memory | `channel-memory.json` | Bot, through a bounded curation process |
+| Exact recent messages | `history.json` | Existing bounded history buffer |
+
+Enable learned memory by merging this into your existing `bot` configuration:
+
+```json
+"channel_memory": {
+  "enabled": true,
+  "file": "channel-memory.json",
+  "max_bytes": 65536,
+  "batch_messages": 40,
+  "interval_seconds": 300
+}
+```
+
+It is off by default. Relative paths resolve next to the configuration file, so
+containers normally write `/data/channel-memory.json` on the existing PVC.
+No new Kubernetes Secret, volume or deployment permission is required. The file
+must be distinct from configuration, credentials, persona, fixed memory and
+history; aliases to the same existing inode are rejected too.
+
+All accepted live messages in watched channels are observed, including ordinary
+conversation from participants outside the inference allowlist. Bot answers and
+reaction/redaction context are observed too. Playback, DMs and unconfigured
+channels are excluded by the same ingress rules as history. Enabling this means
+ordinary channel conversation can lead to background inference, even if nobody
+addresses the bot. The curator uses the configured model/auth, with low reasoning
+and no tools. No API billing fallback is added. These extra calls consume the
+account's quota or API budget; API-key curation uses an 8,192-token generation
+ceiling, while OAuth omits the unsupported `max_output_tokens` field.
+
+The curator receives the previous learned memory plus a batch of observations.
+It returns a complete replacement: keep enduring events, useful explicitly
+stated preferences, important decisions and recurring jokes; merge duplicates,
+apply corrections and discard stale or lower-value details. Recent trivia must
+not automatically displace an important old event. This is selective memory,
+not an ever-growing archive or a summary that covers only the latest topic.
+Attribution, dates, uncertainty and the difference between fact and fiction are
+part of the curation instructions. Selection is model-generated and can make
+mistakes; the byte bound is enforced by Go, not entrusted to the prompt.
+
+`max_bytes` is a hard ceiling on the entire serialized UTF-8 JSON file, including
+metadata and the bounded pending-observation queue. Accepted range: 4 KiB to
+1 MiB, with enough room required for the configured channels. It is not a token
+limit or a size the model must fill. Stored channels divide the available budget;
+roughly half each channel's share is reserved for curated text, capped at 32 KiB
+of JSON-encoded text per channel. The model is asked to stay below 75% of that
+curated-text ceiling. JSON escaping counts toward the actual disk limit.
+
+Each channel has its own memory and pending observations in the shared file.
+Only that channel's curated text is included with its normal answers, as
+untrusted user-role context rather than developer instructions. Curated text is
+not included in spontaneous reaction checks. Removed channels stay on disk but
+are not exposed to other channels or updated. Adding channels can require a
+larger byte budget to preserve existing memories' allocated space.
+
+The background worker checks every five seconds. A channel is eligible once it
+has `batch_messages` pending observations (1–200), or its oldest observation has
+waited `interval_seconds`, or its pending byte share is close to full. It makes
+at most one attempt per channel per interval (minimum 30 seconds). A threshold
+is a trigger, not the exact batch size: all currently buffered observations are
+considered. The worker starts only while conversational inference is idle, but
+an answer may start while maintenance is already in flight. There is at most
+one maintenance request in flight, separate from normal replies; PING handling
+and new answers are not held until maintenance finishes.
+
+Pending observations are independent of the short history window, so removing
+an old entry from `history.json` does not normally remove it before curation.
+They are checkpointed every ten seconds, on graceful shutdown, and immediately
+before a model request. Each observation retains at most 4 KiB of content, or
+less with a small/multi-channel byte budget. If traffic or an API outage fills
+the bounded staging area, the oldest unprocessed observations are dropped and
+a warning/counter records the loss. The file remains bounded even when the
+model is unavailable. This cannot guarantee retention of every noteworthy event.
+
+A valid replacement and removal of its processed observations are persisted in
+one atomic rename with mode 0600. Messages arriving during curation remain pending
+for a later pass. Invalid/oversized model output or a failed write preserves the
+previous memory and batch; attempts are rate-limited rather than retried in a
+tight paid loop. A malformed or oversized existing file is not overwritten:
+startup waits, and `check` reports the problem. Lowering the limit below existing
+state can require offline editing or increasing it again.
+
+On first activation, only the messages still retained in `history.json` are
+seeded, once. Already-discarded conversations cannot be recovered. After that,
+learning covers newly observed messages while the bot is connected. To inspect
+or edit the memory, stop the bot first. Clear a channel's entry to reset its
+learned memory and pending batch. Old short-term history or future discussion
+can mention forgotten facts again. The operator's `memory.md` is always separate.
 
 ## Containers and Kubernetes
 

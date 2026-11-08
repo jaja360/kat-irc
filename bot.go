@@ -118,19 +118,25 @@ func replyLines(s string, limit int) []string {
 }
 
 type Bot struct {
-	cfg         Config
-	ai          *AI
-	history     *History
-	own         *ownMessages
-	members     *memberList
-	filehostURL atomic.Value // string, from the 005 soju.im/FILEHOST token
-	ready       atomic.Bool
-	busy        atomic.Bool
-	reacting    atomic.Bool
-	mu          sync.Mutex
-	last        time.Time
-	lastReact   time.Time
-	requests    sync.WaitGroup
+	cfg           Config
+	ai            *AI
+	history       *History
+	channelMemory *ChannelMemory
+	own           *ownMessages
+	members       *memberList
+	filehostURL   atomic.Value // string, from the 005 soju.im/FILEHOST token
+	ready         atomic.Bool
+	busy          atomic.Bool
+	reacting      atomic.Bool
+	mu            sync.Mutex
+	last          time.Time
+	lastReact     time.Time
+	requests      sync.WaitGroup
+}
+
+func (b *Bot) remember(ch string, message Message) {
+	b.history.add(ch, message)
+	b.channelMemory.observe(ch, message, time.Now().UTC())
 }
 
 // ownMessages tracks the bot's own recent message ids per channel (echo-message).
@@ -227,7 +233,7 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 	account, _ := e.Tags.Get("account")
 	msgid, _ := e.Tags.Get("msgid")
 	content := fmt.Sprintf("IRC nick=%s account=%s: %s", e.Source.Name, account, clean(msg))
-	b.history.add(ch, Message{Role: "user", Content: content, MsgID: msgid})
+	b.remember(ch, Message{Role: "user", Content: content, MsgID: msgid})
 	if !triggered(msg, b.cfg.IRC.Nick) {
 		b.maybeReact(ctx, c, ch, msgid)
 		return
@@ -269,7 +275,7 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 		defer clearTyping()
 		reqCtx, cancel := context.WithTimeout(ctx, time.Duration(b.cfg.OpenAI.TimeoutSeconds)*time.Second)
 		defer cancel()
-		opts := replyOptions{presence: b.presenceSummary(c, ch)}
+		opts := replyOptions{presence: b.presenceSummary(c, ch), channelMemory: b.channelMemory.summary(ch)}
 		if b.cfg.Bot.Redaction && c.HasCapability("echo-message") && c.HasCapability("draft/message-redaction") {
 			opts.redact = true
 			opts.ownMessages = b.ownSummary(ch)
@@ -322,7 +328,7 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 			}
 			b.sendAnswer(c, ch, line, replyTo, i == 0)
 		}
-		b.history.add(ch, Message{Role: "assistant", Content: strings.Join(lines, "\n")})
+		b.remember(ch, Message{Role: "assistant", Content: strings.Join(lines, "\n")})
 	}()
 }
 
@@ -375,7 +381,7 @@ func (b *Bot) applyReactions(c *girc.Client, ch string, calls []ToolCall) int {
 		sent++
 		slog.Info("reacted", "channel", ch, "emoji", emoji, "msgid", args.MsgID, "reason", logNote(args.Reason))
 		// Remember the action so the model does not react to the same message twice.
-		b.history.add(ch, Message{Role: "assistant", Content: fmt.Sprintf("[reacted %s to msgid=%s]", emoji, args.MsgID)})
+		b.remember(ch, Message{Role: "assistant", Content: fmt.Sprintf("[reacted %s to msgid=%s]", emoji, args.MsgID)})
 	}
 	return sent
 }
@@ -457,7 +463,7 @@ func (b *Bot) applyRedactions(c *girc.Client, ch string, calls []ToolCall) int {
 			return 0
 		}
 		slog.Info("redacted own message", "channel", ch, "msgid", args.MsgID, "reason", logNote(args.Reason))
-		b.history.add(ch, Message{Role: "assistant", Content: fmt.Sprintf("[redacted msgid=%s]", args.MsgID)})
+		b.remember(ch, Message{Role: "assistant", Content: fmt.Sprintf("[redacted msgid=%s]", args.MsgID)})
 		return 1
 	}
 	return 0
@@ -638,7 +644,7 @@ func (b *Bot) sendReaction(c *girc.Client, ch, emoji, msgid string) bool {
 		return false
 	}
 	slog.Info("reacted", "channel", ch, "emoji", emoji, "msgid", msgid)
-	b.history.add(ch, Message{Role: "assistant", Content: fmt.Sprintf("[reacted %s to msgid=%s]", emoji, msgid)})
+	b.remember(ch, Message{Role: "assistant", Content: fmt.Sprintf("[reacted %s to msgid=%s]", emoji, msgid)})
 	return true
 }
 
@@ -674,7 +680,7 @@ func (b *Bot) acceptTags(c *girc.Client, e girc.Event) {
 		replyTo, _ = e.Tags.Get("+draft/reply")
 	}
 	account, _ := e.Tags.Get("account")
-	b.history.add(ch, Message{Role: "user", Content: fmt.Sprintf("IRC nick=%s account=%s: %s %s to msgid=%s", e.Source.Name, account, action, react, replyTo)})
+	b.remember(ch, Message{Role: "user", Content: fmt.Sprintf("IRC nick=%s account=%s: %s %s to msgid=%s", e.Source.Name, account, action, react, replyTo)})
 	slog.Info("reaction received", "channel", ch, "nick", e.Source.Name, "action", action, "emoji", react, "msgid", replyTo)
 }
 

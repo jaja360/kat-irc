@@ -57,8 +57,8 @@ MIT licensed. No personal profile or deployment-specific configuration is bundle
   `soju.im/FILEHOST` HTTP upload host, and post the resulting URL. The image is
   produced by the configured image model, not by the chat model.
 - Makes one conversational inference request at a time, with a cooldown and timeout. IRC PING
-  handling remains active while inference runs. Replies are sanitized and split
-  into bounded UTF-8 lines. Failed/incomplete streams are not posted as answers.
+  handling remains active while inference runs. Replies are sanitized and automatically split
+  into UTF-8-safe components, using native multiline when negotiated. Failed/incomplete streams are not posted as answers.
 - Reconnects to IRC with backoff. Credentials, persona and memory never need to
   appear in Kubernetes manifests.
 
@@ -145,6 +145,7 @@ resolve beside the configuration file. The container reads `/data/config.json`.
 | Setting | Purpose |
 | --- | --- |
 | `irc.server`, `irc.port` | Arbitrary IRC hostname/IP and port; no server is hardcoded |
+| `irc.multiline` | `auto` (default) negotiates native multiline and server limits; `off` forces plain messages |
 | `irc.nick`, `irc.channels` | Bot identity, trigger prefix and channels to join |
 | `irc.tls` | Enable certificate-verified TLS, minimum TLS 1.2 |
 | `irc.server_name`, `irc.ca_file` | Optional TLS name override and custom CA |
@@ -160,7 +161,9 @@ resolve beside the configuration file. The container reads `/data/config.json`.
 | `openai.max_output_tokens` | API-key output budget; omitted for direct ChatGPT OAuth |
 | `bot.persona`, `bot.persona_file`, `bot.memory_file` | Inline instructions plus optional external files |
 | `bot.history_messages`, `bot.history_file` | 1–200 recent messages per channel; empty path disables persistence |
-| `bot.cooldown_seconds`, `bot.max_reply_lines` | Minimum interval between requests and 1–20 output lines |
+| `bot.cooldown_seconds` | Minimum interval between conversational requests |
+| `bot.max_reply_bytes` | Optional logical-answer UTF-8 byte budget, default 8192, range 512–65536; independent of server transport limits |
+| `bot.max_reply_lines` | Legacy optional budget, 0–20; a positive value also caps answer bytes at `value × 350`; omit or set 0 for automatic transport sizing |
 | `bot.typing` | Send IRCv3 typing indicators (`+typing`) while generating an answer |
 | `bot.presence` | Add a live channel-membership summary (presence, away, account) to each request |
 | `bot.reply_threading` | `model` (default), `always` or `never`; whether answers carry a `+reply` tag |
@@ -276,10 +279,10 @@ API-key search can incur tool-call and retrieved-token charges in addition to
 inference. ChatGPT OAuth uses the account's plan limits.
 
 Completed response annotations are converted to numbered references and
-clickable source URLs in IRC. URL lines share `max_reply_lines` with the answer;
-room is reserved for all cited URLs even if the answer is shortened. If the
-sources cannot fit or a URL cannot be displayed safely in a single IRC line,
-the bot returns an error instead of silently removing attribution. Search does
+clickable source URLs in IRC. Source URLs share the logical answer byte budget;
+room is reserved for them even if the prose is shortened. If the sources cannot
+fit or a URL cannot be displayed safely in one component for plain-client
+fallback, the bot returns an error instead of silently removing attribution. Search does
 not download or execute arbitrary pages inside the pod. Queries are handled by
 the hosted search service; avoid putting private information in public searches.
 
@@ -299,14 +302,17 @@ fields):
     "max_output_tokens": 4096,
     "web_search": true
   },
-  "bot": { "max_reply_lines": 16 }
+  "bot": { "max_reply_bytes": 8192 }
 }
 ```
 
-`max_reply_lines` is a hard output cap, not a request to fill every line. Six
-lines carry at most roughly 2,100 UTF-8 bytes of answer text before truncation;
-UTF-8 bytes are not model tokens. Higher line counts also take longer to send
-because the bot spaces lines to reduce flooding. Up to 20 lines are supported.
+`max_reply_bytes` limits the complete logical answer, including source and image
+URLs; it is not a target to fill. Transport line and batch sizes are detected
+from the server. Existing `max_reply_lines` settings remain accepted as a legacy
+byte budget (16 means at most 5,600 bytes), but no longer represent the exact
+number of physical IRC commands. Omit it or set it to 0 to use only the new
+logical-answer budget. Higher budgets take longer to send because the bot paces
+outbound commands to reduce flooding.
 `max_output_tokens` is an API-key generation budget, including reasoning tokens;
 it is intentionally omitted for ChatGPT OAuth. A higher reasoning effort can
 increase latency and quota consumption. No exact response-time improvement is
@@ -330,6 +336,50 @@ Persona, memory and the current channel history are sent to OpenAI for each
 answer. Keeping them out of Git protects repository privacy, but does not make
 prompt contents inaccessible to channel participants through model answers.
 Only supply material appropriate for the channels in which the bot runs.
+
+## Automatic IRCv3 multiline
+
+By default, kat-irc requests `draft/multiline` alongside `batch` and
+`message-tags`. It reads `max-bytes` and optional `max-lines` from CAP LS/NEW,
+checks that the capability was ACKed, and refreshes the limits when capabilities
+change. No server-size settings need to be copied into kat-irc. If support or
+valid limits are missing, a capability is removed, or outgoing multiline is
+rejected, it uses ordinary messages for subsequent answers. Use
+`irc.multiline: "off"` to force plain transport for troubleshooting.
+
+The complete answer preserves paragraphs and indentation. Wrapping a long
+logical line uses `draft/multiline-concat`, so a capable client can reassemble it
+without adding artificial line breaks. Components are sized using the IRC line
+allowance, sender prefix, target and girc's own limit. Oversized answers are
+packed into multiple batches within the advertised byte/line limits. A newline
+between logical lines counts toward a batch's byte limit. Blank-only batches
+are never emitted. Very small/invalid limits use plain transport instead.
+Independent hard safety ceilings bound batch size and receive buffers; these
+are not server limits users must synchronize manually.
+
+Reply tags go on the opening BATCH, not its component messages. On echo-message,
+the logical msgid and assembled text are tracked once for redaction. An answer
+occupies one history/memory observation even if transport uses several batches.
+Source/image URLs are kept whole where plain fallback permits; an unrenderable
+answer is reported instead of silently dropping attribution. Outbound commands
+remain paced; native multiline does not bypass server flood controls. A client
+may display a batch only after its closing command, so grouping does not imply
+instant display of the first fragment.
+
+Live incoming multiline is assembled before trigger matching, account checks,
+inference and history ingestion. Opening metadata (account, time, msgid) is
+retained, and sender/target/account consistency is checked. Incomplete, expired,
+oversized or malformed batches are discarded, never processed as partial
+questions. Only top-level live batches are accepted; nested/history batches and
+unknown references remain ignored to avoid replay-triggered inference. Buffers
+are bounded by count and bytes, expired on batch traffic, and reset on reconnect.
+
+Servers such as Ergo can deliver plain fallback to recipients that did not
+negotiate multiline, including through a bouncer. That preserves readable text,
+but does not guarantee a single grouped bubble, blank lines or logical msgid
+semantics in every client. Actual Soju/Goguma/senpai support must be checked for
+the deployed versions; the bot does not assume all IRCv3 clients support this
+draft. See the [multiline specification](https://ircv3.net/specs/extensions/multiline).
 
 ## Selective long-term channel memory
 

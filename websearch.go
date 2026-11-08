@@ -91,19 +91,3 @@ func renderWebOutput(output []responseOutput) (string, []webSource, error) {
 	}
 	return strings.TrimSpace(strings.Join(parts, "\n")), sources, nil
 }
-
-// Reserve room for every cited URL even if the answer is truncated. Plain IRC
-// clients render these source URLs as clickable links; no opaque ChatGPT refs.
-func sourcedReplyLines(text string, sources []webSource, limit int) ([]string, error) {
-	if len(sources) == 0 {
-		return replyLines(text, limit), nil
-	}
-	if len(sources) >= limit {
-		return nil, fmt.Errorf("reply line budget cannot fit answer and sources")
-	}
-	lines := replyLines(text, limit-len(sources))
-	for i, s := range sources {
-		lines = append(lines, fmt.Sprintf("[%d] %s", i+1, s.URL))
-	}
-	return lines, nil
-}

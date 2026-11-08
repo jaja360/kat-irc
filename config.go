@@ -68,7 +68,8 @@ type Config struct {
 			MaxPerReply    int    `json:"max_per_reply"`
 			TimeoutSeconds int    `json:"timeout_seconds"`
 		} `json:"images"`
-		Redaction bool `json:"redaction"`
+		Redaction     bool                `json:"redaction"`
+		ChannelMemory ChannelMemoryConfig `json:"channel_memory"`
 	} `json:"bot"`
 }
 
@@ -116,10 +117,43 @@ func loadConfig(path string) (Config, error) {
 	if c.OpenAI.CredentialsFile == "" {
 		c.OpenAI.CredentialsFile = "oauth.json"
 	}
+	if c.Bot.ChannelMemory.Enabled {
+		if c.Bot.ChannelMemory.File == "" {
+			c.Bot.ChannelMemory.File = "channel-memory.json"
+		}
+		if c.Bot.ChannelMemory.MaxBytes == 0 {
+			c.Bot.ChannelMemory.MaxBytes = 65536
+		}
+		if c.Bot.ChannelMemory.BatchMessages == 0 {
+			c.Bot.ChannelMemory.BatchMessages = 40
+		}
+		if c.Bot.ChannelMemory.IntervalSeconds == 0 {
+			c.Bot.ChannelMemory.IntervalSeconds = 300
+		}
+		if c.Bot.ChannelMemory.MaxBytes < 4096 || c.Bot.ChannelMemory.MaxBytes > 1048576 {
+			return c, fmt.Errorf("channel_memory.max_bytes must be 4096..1048576")
+		}
+		if c.Bot.ChannelMemory.BatchMessages < 1 || c.Bot.ChannelMemory.BatchMessages > 200 {
+			return c, fmt.Errorf("channel_memory.batch_messages must be 1..200")
+		}
+		if c.Bot.ChannelMemory.IntervalSeconds < 30 {
+			return c, fmt.Errorf("channel_memory.interval_seconds must be at least 30")
+		}
+		if c.Bot.ChannelMemory.MaxBytes < 1024+len(c.IRC.Channels)*2048 {
+			return c, fmt.Errorf("channel_memory.max_bytes is too small for the configured channels")
+		}
+	}
 	// Relative file paths are always relative to the configuration file.
-	for _, p := range []*string{&c.OpenAI.CredentialsFile, &c.IRC.CAFile, &c.Bot.PersonaFile, &c.Bot.MemoryFile, &c.Bot.HistoryFile} {
+	for _, p := range []*string{&c.OpenAI.CredentialsFile, &c.IRC.CAFile, &c.Bot.PersonaFile, &c.Bot.MemoryFile, &c.Bot.HistoryFile, &c.Bot.ChannelMemory.File} {
 		if *p != "" && !filepath.IsAbs(*p) {
 			*p = filepath.Join(filepath.Dir(path), *p)
+		}
+	}
+	if c.Bot.ChannelMemory.Enabled {
+		for _, protected := range []string{path, c.Bot.PersonaFile, c.Bot.MemoryFile, c.Bot.HistoryFile, c.OpenAI.CredentialsFile, c.IRC.CAFile} {
+			if protected != "" && sameFilePath(c.Bot.ChannelMemory.File, protected) {
+				return c, fmt.Errorf("channel_memory.file must be separate from configuration, credentials, persona, memory and history")
+			}
 		}
 	}
 	if c.OpenAI.APIKey == "" {

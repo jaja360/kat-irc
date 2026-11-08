@@ -292,7 +292,7 @@ func TestIRCIntegration(t *testing.T) {
 	c.Bot.Reactions.Enabled = false // this test asserts exactly one API call
 	a := &AI{cfg: c, http: api.Client(), endpoint: api.URL}
 	h, _ := newHistory("", 40)
-	b := &Bot{cfg: c, ai: a, history: h}
+	b := &Bot{cfg: c, ai: a, history: h, channelMemory: testChannelMemory(t, "#chat")}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -364,6 +364,20 @@ func TestIRCIntegration(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("shutdown stuck")
+	}
+	b.channelMemory.mu.Lock()
+	defer b.channelMemory.mu.Unlock()
+	pending := b.channelMemory.doc.Channels["#chat"].Pending
+	ordinary, other := false, false
+	for _, o := range pending {
+		ordinary = ordinary || strings.Contains(o.Message.Content, "Hello Kat: nothing")
+		other = other || strings.Contains(o.Message.Content, "unauthorized")
+		if strings.Contains(o.Message.Content, "Kat: replay") || strings.Contains(o.Message.Content, "Kat: old") {
+			t.Fatal("playback entered learned memory")
+		}
+	}
+	if !ordinary || !other {
+		t.Fatal("ordinary channel participants were not observed for memory", pending)
 	}
 }
 

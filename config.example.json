@@ -49,6 +49,13 @@
       "max_per_reply": 1,
       "timeout_seconds": 120
     },
-    "redaction": false
+    "redaction": false,
+    "channel_memory": {
+      "enabled": false,
+      "file": "channel-memory.json",
+      "max_bytes": 65536,
+      "batch_messages": 40,
+      "interval_seconds": 300
+    }
   }
 }

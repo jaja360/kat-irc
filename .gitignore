@@ -9,3 +9,5 @@
 *.lock
 *.test
 coverage.out
+
+/channel-memory.json

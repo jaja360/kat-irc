@@ -53,6 +53,9 @@ func run() error {
 			return err
 		}
 		if command == "check" {
+			if _, err := newChannelMemory(c.Bot.ChannelMemory, c.IRC.Channels); err != nil {
+				return err
+			}
 			fmt.Println("Configuration valid (credentials and network not checked)")
 			return nil
 		}
@@ -91,6 +94,7 @@ func waitForSetup(ctx context.Context, path string, interval time.Duration) (*Bo
 		stage := "configuration and persona/memory files"
 		var a *AI
 		var h *History
+		var memory *ChannelMemory
 		if err == nil {
 			stage = "OpenAI credentials (run login or set openai.api_key)"
 			a, err = newAI(c)
@@ -100,7 +104,14 @@ func waitForSetup(ctx context.Context, path string, interval time.Duration) (*Bo
 			h, err = newHistory(c.Bot.HistoryFile, c.Bot.HistoryMessages)
 		}
 		if err == nil {
-			return &Bot{cfg: c, ai: a, history: h, own: newOwnMessages(50), members: newMemberList()}, nil
+			stage = "channel memory file"
+			memory, err = newChannelMemory(c.Bot.ChannelMemory, c.IRC.Channels)
+			if err == nil {
+				err = memory.seed(h, time.Now().UTC())
+			}
+		}
+		if err == nil {
+			return &Bot{cfg: c, ai: a, history: h, channelMemory: memory, own: newOwnMessages(50), members: newMemberList()}, nil
 		}
 		// Avoid logging configuration values, tokens, or file contents.
 		if stage != previous {
@@ -144,6 +155,8 @@ func serve(parent context.Context, path, health string, interval time.Duration) 
 	b, err := waitForSetup(ctx, path, interval)
 	if err == nil {
 		current.Store(b)
+		memoryDone := make(chan struct{})
+		go func() { defer close(memoryDone); b.channelMemory.run(ctx, b.ai, &b.busy) }()
 		saved := make(chan struct{})
 		go func() {
 			defer close(saved)
@@ -156,6 +169,9 @@ func serve(parent context.Context, path, health string, interval time.Duration) 
 				case <-ticker.C:
 					if e := b.history.save(); e != nil {
 						slog.Error("save history", "error", e)
+					}
+					if e := b.channelMemory.save(); e != nil {
+						slog.Error("save channel memory", "error", e)
 					}
 				}
 			}
@@ -171,12 +187,17 @@ func serve(parent context.Context, path, health string, interval time.Duration) 
 			"images", b.cfg.Bot.Images.Enabled,
 			"image_model", b.cfg.Bot.Images.Model,
 			"redaction", b.cfg.Bot.Redaction,
+			"channel_memory", b.cfg.Bot.ChannelMemory.Enabled,
 		)
 		err = b.run(ctx)
 		cancel()
 		<-saved
+		<-memoryDone
 		if e := b.history.save(); e != nil {
 			slog.Error("save history", "error", e)
+		}
+		if e := b.channelMemory.save(); e != nil {
+			slog.Error("save channel memory", "error", e)
 		}
 	}
 	select {

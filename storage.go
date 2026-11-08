@@ -2,18 +2,26 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 )
 
 func atomicJSON(path string, v any) error {
+	return atomicJSONLimit(path, v, 0)
+}
+
+func atomicJSONLimit(path string, v any, maxBytes int) error {
 	if e := os.MkdirAll(filepath.Dir(path), 0700); e != nil {
 		return e
 	}
 	b, e := json.MarshalIndent(v, "", "  ")
 	if e != nil {
 		return e
+	}
+	if maxBytes > 0 && len(b) > maxBytes {
+		return fmt.Errorf("JSON file exceeds configured byte limit")
 	}
 	f, e := os.CreateTemp(filepath.Dir(path), ".kat-*")
 	if e != nil {

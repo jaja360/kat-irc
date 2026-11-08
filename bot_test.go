@@ -1536,6 +1536,95 @@ func TestOwnMessages(t *testing.T) {
 	}
 }
 
+func TestUnconfiguredChannelIsParted(t *testing.T) {
+	// Extra channels attached by a bouncer or the server are parted and must not
+	// block readiness.
+	listener, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer listener.Close()
+	c, e := loadConfig("config.example.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	c.IRC.TLS = false
+	c.IRC.Server = "127.0.0.1"
+	c.IRC.Port = listener.Addr().(*net.TCPAddr).Port
+	c.Bot.HistoryFile = ""
+	c.Bot.Typing = false
+	c.Bot.Presence = false
+	c.Bot.Reactions.Enabled = false
+	c.Bot.Images.Enabled = false
+	c.Bot.Redaction = false
+	h, _ := newHistory("", 40)
+	b := &Bot{cfg: c, history: h}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- b.run(ctx) }()
+	conn, e := listener.Accept()
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
+	scan := bufio.NewScanner(conn)
+	send := func(s string) {
+		t.Helper()
+		if _, e := fmt.Fprint(conn, s+"\r\n"); e != nil {
+			t.Fatal(e)
+		}
+	}
+	until := func(sub string) string {
+		t.Helper()
+		for scan.Scan() {
+			l := scan.Text()
+			if strings.Contains(l, sub) {
+				return l
+			}
+		}
+		t.Fatalf("missing %q: %v", sub, scan.Err())
+		return ""
+	}
+	until("CAP LS")
+	send(":server CAP * LS :message-tags server-time account-tag batch")
+	req := until("CAP REQ :")
+	send(":server CAP Kat ACK :" + strings.TrimPrefix(req, "CAP REQ :"))
+	until("CAP END")
+	send(":server 001 Kat :Welcome")
+	send(":server 005 Kat CHANTYPES=# CASEMAPPING=ascii :supported")
+	send(":server 376 Kat :End MOTD")
+	until("JOIN #chat")
+	// The bouncer attaches an extra channel before the configured one.
+	send(":Kat!kat@localhost JOIN #announce")
+	part := until("PART #announce")
+	if !strings.Contains(part, "not configured") {
+		t.Fatal("unexpected PART reason", part)
+	}
+	// Our own PART echo must not be treated as a lost channel.
+	send(":Kat!kat@localhost PART #announce")
+	send("PING :still-here")
+	until("PONG")
+	if b.ready.Load() {
+		t.Fatal("ready without the configured channel")
+	}
+	send(":Kat!kat@localhost JOIN #chat")
+	send("PING :joined")
+	until("PONG")
+	if !b.ready.Load() {
+		t.Fatal("extra channel blocked readiness")
+	}
+	// Channels attached later are left too, without dropping readiness.
+	send(":Kat!kat@localhost JOIN #announce")
+	until("PART #announce")
+	send("PING :after-part")
+	until("PONG")
+	if !b.ready.Load() {
+		t.Fatal("extra channel dropped readiness")
+	}
+}
+
 func TestIRCRedaction(t *testing.T) {
 	// Kat learns its own msgid from echo-message, then retracts it via REDACT.
 	listener, e := net.Listen("tcp", "127.0.0.1:0")

@@ -394,12 +394,21 @@ not included in spontaneous reaction checks. Removed channels stay on disk but
 are not exposed to other channels or updated. Adding channels can require a
 larger byte budget to preserve existing memories' allocated space.
 
-The background worker checks every five seconds. A channel is eligible once it
-has `batch_messages` pending observations (1–200), or its oldest observation has
-waited `interval_seconds`, or its pending byte share is close to full. It makes
-at most one attempt per channel per interval (minimum 30 seconds). A threshold
-is a trigger, not the exact batch size: all currently buffered observations are
-considered. The worker starts only while conversational inference is idle, but
+The background worker checks every five seconds. A channel is eligible only
+when it has observed at least `batch_messages` new entries (1–200) since its last
+successful rewrite AND `interval_seconds` has elapsed since its last attempt
+(minimum 30 seconds). Idle time and pending byte pressure never bypass the
+message threshold. With the defaults, one isolated message causes no rewrite,
+even after days of silence. The threshold counts accepted user messages, bot
+answers and reaction/redaction context, not only messages addressed to the bot.
+
+A persisted sequence checkpoint counts new observations independently of queue
+retention, so a busy channel can still reach the threshold if the bounded buffer
+has dropped some entries. Only buffered observations can enter the next rewrite;
+dropped observations remain unavailable. Older files without a checkpoint are
+migrated conservatively by counting their retained pending tail as new. A
+threshold is a trigger, not an exact batch size: all currently buffered entries
+are considered, and arrivals during a rewrite count toward the following batch. The worker starts only while conversational inference is idle, but
 an answer may start while maintenance is already in flight. There is at most
 one maintenance request in flight, separate from normal replies; PING handling
 and new answers are not held until maintenance finishes.

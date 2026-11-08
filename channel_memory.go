@@ -32,12 +32,13 @@ type memoryObservation struct {
 	Message    Message   `json:"message"`
 }
 type channelMemories struct {
-	Memory        string              `json:"memory"`
-	UpdatedAt     time.Time           `json:"updated_at"`
-	LastAttemptAt time.Time           `json:"last_attempt_at"`
-	NextSequence  uint64              `json:"next_sequence"`
-	Dropped       uint64              `json:"dropped_pending"`
-	Pending       []memoryObservation `json:"pending"`
+	Memory           string              `json:"memory"`
+	UpdatedAt        time.Time           `json:"updated_at"`
+	LastAttemptAt    time.Time           `json:"last_attempt_at"`
+	NextSequence     uint64              `json:"next_sequence"`
+	ProcessedThrough *uint64             `json:"processed_through,omitempty"`
+	Dropped          uint64              `json:"dropped_pending"`
+	Pending          []memoryObservation `json:"pending"`
 }
 type memoryDocument struct {
 	Version  int                         `json:"version"`
@@ -143,9 +144,23 @@ func newChannelMemory(cfg ChannelMemoryConfig, channels []string) (*ChannelMemor
 		if encodedStringSize(row.Memory) > m.summaryBudget() {
 			return nil, fmt.Errorf("stored channel memory exceeds its share of max_bytes; increase the limit or edit it offline")
 		}
+		// Older files have no explicit checkpoint. Conservatively count only the
+		// retained pending tail as new; do not mistake lifetime sequence numbers
+		// for observations since the last successful rewrite.
+		if row.ProcessedThrough == nil {
+			through := row.NextSequence
+			if len(row.Pending) > 0 {
+				through = row.Pending[0].Sequence - 1
+			}
+			row.ProcessedThrough = &through
+			m.dirty = true
+		}
+		if *row.ProcessedThrough > row.NextSequence {
+			return nil, fmt.Errorf("invalid channel memory processed checkpoint")
+		}
 		var last uint64
 		for _, o := range row.Pending {
-			if o.Sequence <= last || o.Sequence > row.NextSequence || (o.Message.Role != "user" && o.Message.Role != "assistant") {
+			if o.Sequence <= last || o.Sequence <= *row.ProcessedThrough || o.Sequence > row.NextSequence || (o.Message.Role != "user" && o.Message.Role != "assistant") {
 				return nil, fmt.Errorf("invalid channel memory pending sequence")
 			}
 			last = o.Sequence
@@ -290,10 +305,7 @@ func (m *ChannelMemory) nextJob(now time.Time) (*memoryJob, error) {
 	sort.Strings(channels)
 	for _, ch := range channels {
 		row := m.doc.Channels[ch]
-		if len(row.Pending) == 0 || now.Sub(row.LastAttemptAt) < interval {
-			continue
-		}
-		if len(row.Pending) < m.cfg.BatchMessages && memoryRowSize(row) < m.quota()*3/4 && now.Sub(row.Pending[0].ObservedAt) < interval {
+		if len(row.Pending) == 0 || row.NextSequence-*row.ProcessedThrough < uint64(m.cfg.BatchMessages) || now.Sub(row.LastAttemptAt) < interval {
 			continue
 		}
 		// Checkpoint the pending batch/attempt before spending quota. No network under the lock.
@@ -317,6 +329,8 @@ func (m *ChannelMemory) commit(job *memoryJob, memory string, now time.Time) err
 	row := m.doc.Channels[job.channel]
 	candidate := *row
 	candidate.Memory = memory
+	through := job.through
+	candidate.ProcessedThrough = &through
 	candidate.UpdatedAt = now
 	candidate.Pending = nil
 	for _, o := range row.Pending {

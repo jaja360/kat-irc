@@ -92,8 +92,12 @@ func TestChannelMemoryRewriteAndArrivalsDuringCuration(t *testing.T) {
 	if job, err := restored.nextJob(now.Add(3 * time.Second)); err != nil || job != nil {
 		t.Fatal("retried too soon", job, err)
 	}
+	if job, err := restored.nextJob(now.Add(62 * time.Second)); err != nil || job != nil {
+		t.Fatal("idle tail triggered below batch threshold", job, err)
+	}
+	restored.observe("#chat", Message{Role: "user", Content: "second new observation"}, now.Add(62*time.Second))
 	if job, err := restored.nextJob(now.Add(62 * time.Second)); err != nil || job == nil {
-		t.Fatal("idle tail never processed", job, err)
+		t.Fatal("full new batch was not processed", job, err)
 	}
 }
 func TestChannelMemoryFailedCommitPreservesState(t *testing.T) {
@@ -321,5 +325,90 @@ func TestChannelMemoryIncludedAsDataNotInstructions(t *testing.T) {
 	}
 	if strings.Contains(body["instructions"].(string), "untrusted remembered fact") {
 		t.Fatal("memory promoted to developer instructions")
+	}
+}
+
+func TestChannelMemoryStrictThresholdAndCooldown(t *testing.T) {
+	m := testChannelMemory(t, "#chat")
+	m.cfg.MaxBytes = 65536
+	m.cfg.BatchMessages = 40
+	now := time.Now().UTC()
+	for i := 0; i < 39; i++ {
+		m.observe("#chat", Message{Role: "user", Content: "new observation"}, now)
+	}
+	if job, err := m.nextJob(now.Add(7 * 24 * time.Hour)); err != nil || job != nil {
+		t.Fatal("silence bypassed 40-observation threshold", job, err)
+	}
+	m.observe("#chat", Message{Role: "user", Content: "number 40"}, now.Add(7*24*time.Hour))
+	job, err := m.nextJob(now.Add(7 * 24 * time.Hour))
+	if err != nil || job == nil {
+		t.Fatal("full batch did not trigger", job, err)
+	}
+	// A failed attempt leaves all observations new, but cooldown still applies.
+	if retry, err := m.nextJob(now.Add(7*24*time.Hour + 30*time.Second)); err != nil || retry != nil {
+		t.Fatal("failed attempt bypassed cooldown", retry, err)
+	}
+	if err = m.commit(job, "selected long-term facts", now.Add(7*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 40; i++ {
+		m.observe("#chat", Message{Role: "user", Content: "next batch"}, now.Add(7*24*time.Hour+30*time.Second))
+	}
+	if job, err := m.nextJob(now.Add(7*24*time.Hour + 30*time.Second)); err != nil || job != nil {
+		t.Fatal("full batch bypassed cooldown", job, err)
+	}
+	if job, err := m.nextJob(now.Add(7*24*time.Hour + 61*time.Second)); err != nil || job == nil {
+		t.Fatal("eligible batch did not trigger after cooldown", job, err)
+	}
+}
+
+func TestChannelMemoryPressureCannotBypassThreshold(t *testing.T) {
+	m := testChannelMemory(t, "#chat")
+	m.cfg.BatchMessages = 40
+	now := time.Now().UTC()
+	for i := 0; i < 20; i++ {
+		m.observe("#chat", Message{Role: "user", Content: strings.Repeat("<", 2000)}, now)
+	}
+	if m.doc.Channels["#chat"].Dropped == 0 {
+		t.Fatal("test did not fill bounded queue")
+	}
+	if job, err := m.nextJob(now.Add(24 * time.Hour)); err != nil || job != nil {
+		t.Fatal("byte pressure bypassed count threshold", job, err)
+	}
+	for i := 20; i < 40; i++ {
+		m.observe("#chat", Message{Role: "user", Content: strings.Repeat("<", 2000)}, now)
+	}
+	job, err := m.nextJob(now.Add(24 * time.Hour))
+	if err != nil || job == nil {
+		t.Fatal("bounded queue prevented a busy channel from reaching threshold", job, err)
+	}
+	if len(job.observations) >= 40 {
+		t.Fatal("test should exercise a retained subset after overflow")
+	}
+}
+
+func TestChannelMemoryLegacyCheckpointMigration(t *testing.T) {
+	m := testChannelMemory(t, "#chat")
+	m.cfg.BatchMessages = 40
+	now := time.Now().UTC()
+	old := map[string]any{"version": 1, "channels": map[string]any{"#chat": map[string]any{"memory": "old selected memory", "next_sequence": 500, "pending": []memoryObservation{{Sequence: 500, ObservedAt: now, Message: Message{Role: "user", Content: "only one new observation"}}}}}}
+	if err := atomicJSON(m.cfg.File, old); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := newChannelMemory(m.cfg, []string{"#chat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *restored.doc.Channels["#chat"].ProcessedThrough != 499 {
+		t.Fatal("lifetime sequence was mistaken for new count")
+	}
+	if job, err := restored.nextJob(now.Add(7 * 24 * time.Hour)); err != nil || job != nil {
+		t.Fatal("legacy migration triggered premature curation", job, err)
+	}
+	for i := 0; i < 39; i++ {
+		restored.observe("#chat", Message{Role: "user", Content: "new"}, now)
+	}
+	if job, err := restored.nextJob(now); err != nil || job == nil {
+		t.Fatal("migrated new count did not reach threshold", job, err)
 	}
 }

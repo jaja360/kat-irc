@@ -81,11 +81,11 @@ func TestCompletedWebCitations(t *testing.T) {
 	if strings.Contains(rep.Text, "partial") || strings.Contains(rep.Text, "") || !strings.Contains(rep.Text, "Réponse é 😀. ") || !strings.Contains(rep.Text, "[1]") || len(rep.Sources) != 1 {
 		t.Fatalf("bad rendered answer: %+v", rep)
 	}
-	lines, err := sourcedReplyLines(strings.Repeat(rep.Text, 100), rep.Sources, 3)
-	if err != nil || len(lines) != 3 || lines[2] != "[1] https://example.org/verified" {
-		t.Fatal(lines, err)
+	answer, err := prepareAnswer(strings.Repeat(rep.Text, 100), rep.Sources, nil, 512)
+	if err != nil || len(answer) > 512 || !strings.HasSuffix(answer, "[1] https://example.org/verified") {
+		t.Fatal(answer, err)
 	}
-	if _, err = sourcedReplyLines(rep.Text, rep.Sources, 1); err == nil {
+	if _, err = prepareAnswer(rep.Text, rep.Sources, nil, 8); err == nil {
 		t.Fatal("silently dropped citations")
 	}
 }

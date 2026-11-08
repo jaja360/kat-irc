@@ -26,6 +26,7 @@ type Config struct {
 		Password           string   `json:"password"`
 		SASLPassword       string   `json:"sasl_password"`
 		AllowPlaintextAuth bool     `json:"allow_plaintext_auth"`
+		Multiline          string   `json:"multiline"`
 	} `json:"irc"`
 	OpenAI struct {
 		Auth            string `json:"auth"`
@@ -45,6 +46,7 @@ type Config struct {
 		HistoryFile     string   `json:"history_file"`
 		CooldownSeconds int      `json:"cooldown_seconds"`
 		MaxReplyLines   int      `json:"max_reply_lines"`
+		MaxReplyBytes   int      `json:"max_reply_bytes"`
 		AllowedAccounts []string `json:"allowed_accounts"`
 		Typing          bool     `json:"typing"`
 		Presence        bool     `json:"presence"`
@@ -174,8 +176,20 @@ func loadConfig(path string) (Config, error) {
 	if c.Bot.HistoryMessages < 1 || c.Bot.HistoryMessages > 200 {
 		return c, fmt.Errorf("history_messages must be 1..200")
 	}
-	if c.Bot.MaxReplyLines < 1 || c.Bot.MaxReplyLines > 20 {
-		return c, fmt.Errorf("max_reply_lines must be 1..20")
+	if c.IRC.Multiline == "" {
+		c.IRC.Multiline = "auto"
+	}
+	if c.IRC.Multiline != "auto" && c.IRC.Multiline != "off" {
+		return c, fmt.Errorf("irc.multiline must be auto or off")
+	}
+	if c.Bot.MaxReplyBytes == 0 {
+		c.Bot.MaxReplyBytes = 8192
+	}
+	if c.Bot.MaxReplyBytes < 512 || c.Bot.MaxReplyBytes > 65536 {
+		return c, fmt.Errorf("max_reply_bytes must be 512..65536")
+	}
+	if c.Bot.MaxReplyLines < 0 || c.Bot.MaxReplyLines > 20 {
+		return c, fmt.Errorf("max_reply_lines must be 0..20 (legacy budget; 0 uses max_reply_bytes)")
 	}
 	if c.Bot.CooldownSeconds < 0 {
 		return c, fmt.Errorf("cooldown_seconds must be nonnegative")

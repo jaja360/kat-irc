@@ -30,7 +30,6 @@
     "history_messages": 40,
     "history_file": "history.json",
     "cooldown_seconds": 3,
-    "max_reply_lines": 6,
     "typing": true,
     "presence": true,
     "reply_threading": "model",

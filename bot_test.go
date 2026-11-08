@@ -37,8 +37,19 @@ func TestTrigger(t *testing.T) {
 }
 func TestReplyLines(t *testing.T) {
 	in := strings.Repeat("Unicode é 😏 ", 200) + "\r\nPRIVMSG #else :injection\x01"
-	lines := replyLines(in, 6)
-	if len(lines) != 6 {
+	text, err := prepareAnswer(in, nil, nil, 2100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fragments, err := splitLogical(text, 350)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	for _, f := range fragments {
+		lines = append(lines, f.text)
+	}
+	if len(lines) < 6 || len(text) > 2100 {
 		t.Fatal(len(lines))
 	}
 	for _, l := range lines {

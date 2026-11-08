@@ -94,28 +94,6 @@ func clean(s string) string {
 		return r
 	}, s)
 }
-func replyLines(s string, limit int) []string {
-	s = strings.Join(strings.Fields(clean(s)), " ")
-	var lines []string
-	for len(s) > 0 && len(lines) < limit {
-		n := len(s)
-		if n > 350 {
-			n = 350
-			for !utf8.RuneStart(s[n]) {
-				n--
-			}
-			if space := strings.LastIndexByte(s[:n], ' '); space > n/2 {
-				n = space
-			}
-		}
-		lines = append(lines, strings.TrimSpace(s[:n]))
-		s = strings.TrimSpace(s[n:])
-	}
-	if s != "" && len(lines) > 0 {
-		lines[len(lines)-1] += " …"
-	}
-	return lines
-}
 
 type Bot struct {
 	cfg           Config
@@ -205,7 +183,7 @@ func (b *Bot) allowedChannel(target string) string {
 	return ""
 }
 
-func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started time.Time) {
+func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started time.Time, transport *messageTransport, assembled bool) {
 	if !b.ready.Load() || e.Source == nil || len(e.Params) != 2 || !e.IsFromChannel() || strings.EqualFold(e.Source.Name, c.GetNick()) {
 		return
 	}
@@ -226,13 +204,13 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 		return
 	}
 	msg := e.Last()
-	if len(msg) > 4096 {
+	if (!assembled && len(msg) > 4096) || len(msg) > maxLogicalBytes {
 		return
 	}
 	// Ordinary conversation is context, but only an explicit prefix causes inference.
 	account, _ := e.Tags.Get("account")
 	msgid, _ := e.Tags.Get("msgid")
-	content := fmt.Sprintf("IRC nick=%s account=%s: %s", e.Source.Name, account, clean(msg))
+	content := fmt.Sprintf("IRC nick=%s account=%s: %s", e.Source.Name, account, logicalText(msg))
 	b.remember(ch, Message{Role: "user", Content: content, MsgID: msgid})
 	if !triggered(msg, b.cfg.IRC.Nick) {
 		b.maybeReact(ctx, c, ch, msgid)
@@ -298,37 +276,37 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 		case "model":
 			replyTo, text = b.threadedReply(ch, text)
 		}
-		lines, lineErr := sourcedReplyLines(text, rep.Sources, b.cfg.Bot.MaxReplyLines)
-		if lineErr != nil {
-			slog.Warn("cannot display web citations", "error", lineErr)
+		answer, answerErr := prepareAnswer(text, rep.Sources, nil, b.cfg.replyByteBudget())
+		if answerErr != nil {
+			slog.Warn("cannot format answer", "error", answerErr)
 			c.Cmd.Message(ch, "Unable to display this answer with its sources. Please ask a narrower question.")
 			return
 		}
-		lines = append(lines, b.applyImages(ctx, c, ch, rep.Calls)...)
-		if len(lines) == 0 {
-			switch {
-			case b.cfg.Bot.Images.Enabled && hasToolCall(rep.Calls, imageToolName):
+		images := b.applyImages(ctx, c, ch, rep.Calls)
+		if len(images) > 0 {
+			answer, answerErr = prepareAnswer(text, rep.Sources, images, b.cfg.replyByteBudget())
+		}
+		if answerErr != nil {
+			slog.Warn("cannot format image links", "error", answerErr)
+			return
+		}
+		if answer == "" {
+			if b.cfg.Bot.Images.Enabled && hasToolCall(rep.Calls, imageToolName) {
 				c.Cmd.Message(ch, "I couldn't generate that image. Check the bot logs.")
-			case reactions == 0 && redactions == 0:
+			} else if reactions == 0 && redactions == 0 {
 				slog.Warn("model produced no answer", "channel", ch, "tools", logTools(rep.Calls))
 			}
 			return
 		}
 		clearTyping()
-		for i, line := range lines {
-			if i > 0 {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(800 * time.Millisecond):
-				}
+		if err = b.sendLogicalAnswer(ctx, c, transport, ch, answer, replyTo); err != nil {
+			slog.Warn("send answer", "error", err)
+			if ctx.Err() == nil && c.IsConnected() && c.IsInChannel(ch) {
+				c.Cmd.Message(ch, "Unable to send this answer within the server's limits. Please ask for a shorter answer.")
 			}
-			if !c.IsInChannel(ch) {
-				return
-			}
-			b.sendAnswer(c, ch, line, replyTo, i == 0)
+			return
 		}
-		b.remember(ch, Message{Role: "assistant", Content: strings.Join(lines, "\n")})
+		b.remember(ch, Message{Role: "assistant", Content: answer})
 	}()
 }
 
@@ -519,18 +497,6 @@ func (b *Bot) setTyping(c *girc.Client, ch, state string) {
 	c.Send(&girc.Event{Command: "TAGMSG", Tags: tags, Params: []string{ch}})
 }
 
-// sendAnswer posts one answer line, tagging the first as a reply when replyTo is set.
-func (b *Bot) sendAnswer(c *girc.Client, ch, line, replyTo string, first bool) {
-	if first && replyTo != "" && c.HasCapability("message-tags") {
-		tags := girc.Tags{}
-		if err := tags.Set("+reply", replyTo); err == nil {
-			c.Send(&girc.Event{Command: girc.PRIVMSG, Tags: tags, Params: []string{ch, line}})
-			return
-		}
-	}
-	c.Cmd.Message(ch, line)
-}
-
 // presenceSummary renders a bounded snapshot of the channel's tracked members.
 func (b *Bot) presenceSummary(c *girc.Client, ch string) string {
 	if !b.cfg.Bot.Presence {
@@ -704,9 +670,14 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 	if b.cfg.IRC.SASLUser != "" {
 		cfg.SASL = &girc.SASLPlain{User: b.cfg.IRC.SASLUser, Pass: b.cfg.IRC.SASLPassword}
 	}
+	cfg.SupportedCaps = map[string][]string{}
+	if b.cfg.IRC.Multiline != "off" {
+		cfg.SupportedCaps[multilineCap] = nil
+	}
 	if b.cfg.Bot.Redaction {
 		// echo-message is how we learn the msgids of our own messages.
-		cfg.SupportedCaps = map[string][]string{"echo-message": nil, "draft/message-redaction": nil}
+		cfg.SupportedCaps["echo-message"] = nil
+		cfg.SupportedCaps["draft/message-redaction"] = nil
 	}
 	c := girc.New(cfg)
 	var saslOK atomic.Bool
@@ -723,6 +694,8 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 		}
 	}
 	started := time.Now()
+	transport := newMessageTransport(started)
+	transport.off = b.cfg.IRC.Multiline == "off"
 	c.Handlers.Add("903", func(c *girc.Client, _ girc.Event) {
 		saslOK.Store(true)
 		// soju re-advertises sasl (CAP NEW) once the upstream connects. Dropping
@@ -758,11 +731,13 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 			return
 		}
 		registered.Store(true)
+		ml := transport.outgoingLimits()
 		slog.Info("connected", "server", b.cfg.IRC.Server,
 			"message-tags", c.HasCapability("message-tags"),
 			"account-tag", c.HasCapability("account-tag"),
 			"echo-message", c.HasCapability("echo-message"),
 			"message-redaction", c.HasCapability("draft/message-redaction"),
+			"multiline_max_bytes", ml.bytes, "multiline_max_lines", ml.lines,
 		)
 		if b.cfg.Bot.Redaction && (!c.HasCapability("echo-message") || !c.HasCapability("draft/message-redaction")) {
 			slog.Warn("redaction enabled but the server did not negotiate draft/message-redaction",
@@ -795,26 +770,53 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 			go c.Close()
 		}
 	})
-	c.Handlers.Add(girc.PRIVMSG, func(c *girc.Client, e girc.Event) { b.accept(ctx, c, e, started) })
+	c.Handlers.Add(girc.ALL_EVENTS, func(c *girc.Client, e girc.Event) {
+		deliver := func(event girc.Event, assembled bool) {
+			if event.Source != nil && strings.EqualFold(event.Source.Name, c.GetNick()) {
+				if b.cfg.Bot.Redaction {
+					id, _ := event.Tags.Get("msgid")
+					if id != "" && len(event.Params) > 0 {
+						if ch := b.allowedChannel(event.Params[0]); ch != "" {
+							b.own.add(ch, id, logicalText(event.Last()))
+						}
+					}
+				}
+				return
+			}
+			b.accept(ctx, c, event, started, transport, assembled)
+		}
+		switch e.Command {
+		case "CAP":
+			transport.cap(e)
+		case "FAIL":
+			transport.fail(e)
+		case "BATCH":
+			if len(e.Params) > 0 && strings.HasPrefix(e.Params[0], "+") && !b.ready.Load() {
+				return
+			}
+			if _, nested := e.Tags.Get("batch"); nested {
+				transport.line(e, time.Now())
+			}
+			if logical := transport.batch(e, b.allowedChannel, time.Now()); logical != nil {
+				deliver(*logical, true)
+			}
+		case girc.PRIVMSG:
+			if _, batched := e.Tags.Get("batch"); batched {
+				transport.line(e, time.Now())
+				return
+			}
+			deliver(e, false)
+		default:
+			if _, batched := e.Tags.Get("batch"); batched {
+				transport.line(e, time.Now())
+			}
+		}
+	})
 	c.Handlers.Add("TAGMSG", func(c *girc.Client, e girc.Event) { b.acceptTags(c, e) })
 	for _, numeric := range []string{"433", "432", "471", "473", "474", "475", "476", "477", "489", "904", "905", "906"} {
 		c.Handlers.Add(numeric, func(c *girc.Client, e girc.Event) {
 			slog.Error("IRC registration/join failed", "numeric", e.Command)
 			go c.Close()
-		})
-	}
-	if b.cfg.Bot.Redaction {
-		c.Handlers.Add(girc.ALL_EVENTS, func(c *girc.Client, e girc.Event) {
-			if e.Command != girc.PRIVMSG || e.Source == nil || len(e.Params) < 1 || !strings.EqualFold(e.Source.Name, c.GetNick()) {
-				return
-			}
-			id, _ := e.Tags.Get("msgid")
-			if id == "" {
-				return
-			}
-			if ch := b.allowedChannel(e.Params[0]); ch != "" {
-				b.own.add(ch, id, clean(e.Last()))
-			}
 		})
 	}
 	if b.cfg.Bot.Presence {

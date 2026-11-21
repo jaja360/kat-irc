@@ -337,6 +337,80 @@ answer. Keeping them out of Git protects repository privacy, but does not make
 prompt contents inaccessible to channel participants through model answers.
 Only supply material appropriate for the channels in which the bot runs.
 
+## Image understanding (no image cache)
+
+Enable visual understanding separately from image generation:
+
+```json
+"vision": {
+  "enabled": true
+}
+```
+
+Place this object inside `bot`. It uses the configured `openai.model` and the
+same authentication as conversation requests; there is no separate vision API
+key. The selected model/account must accept image input. Both API-key and
+ChatGPT OAuth request construction are covered by local mock tests, but live
+OAuth/model availability must be verified with your account.
+
+When someone addresses Kat, image links in that question have first priority,
+then images in its IRC reply target (`+reply`, or legacy `+draft/reply`). With no
+reply target or direct image, Kat considers images from the last 8 history
+entries in that channel, newest first. A reply target must still be retained in
+`history.json`. Plain messages and silent reaction checks do not download or
+analyze images. There are no cross-channel lookups or playback-triggered scans.
+
+The first selected occurrence of a URL is downloaded into RAM and sent as an
+`input_image` to a short, tool-free description request. The normal conversational
+request receives that description. This costs one additional model request per
+new image, using the same overall reply timeout. Subsequent requests reuse the
+saved description without downloading or resending the image. Saved descriptions
+are included with their messages throughout the retained conversation history,
+even outside the window used to discover new images. Descriptions are
+stored with the originating message in `history.json` (up to 2400 UTF-8 bytes
+and four descriptions per message), survive restarts, and expire with the
+bounded history. A URL can be analyzed again after its description leaves that
+history. URL identity is assumed stable: replacing the bytes behind a URL does
+not refresh an existing description.
+
+Only text and URLs are persisted, never image bytes or base64. Descriptions are
+also submitted as explicitly untrusted observations to channel-memory curation,
+if enabled; the existing selection rules decide whether to retain anything long
+term. A short description is lossy: small text or details omitted from it cannot
+be recovered by the conversation model. This version has no forced re-inspection
+command. Failed images are reported to the model as unavailable, and the rest of
+the question is still answered. Failed attempts may be retried on a later turn.
+
+JPEG, PNG and WebP are accepted. GIFs use only the first frame, converted to PNG
+in RAM. SVG, HTML landing pages, video and arbitrary attachments are unsupported.
+Public links need a recognized image extension; links on the configured or
+server-advertised FILEHOST origin can be extensionless. The file host must permit
+unauthenticated GET downloads: Kat never sends its IRC, OAuth or API credentials
+to an image URL.
+
+| `bot.vision` setting | Default and limits |
+| --- | --- |
+| `enabled` | `false`; opt in to downloading and sending selected images to the model |
+| `max_images` | 2 new images per triggered turn, range 1–4 (also bounds failed attempts) |
+| `recent_messages` | Last 8 history entries, range 1–40; explicit reply targets may be older |
+| `max_image_bytes` | 8388608 per image; range 1024–16777216; decoded dimensions limited to 20 megapixels |
+| `timeout_seconds` | 10 per download, range 1–30; also subject to the overall response timeout |
+| `allow_private_origins` | Empty list; exact HTTP(S) origins explicitly allowed to reach private addresses |
+
+The configured `bot.images.filehost` or server-advertised FILEHOST origin is
+trusted automatically for internal downloads, even when image generation is off.
+For a different internal download origin, add it explicitly, for example
+`"allow_private_origins": ["http://files.example.internal:8080"]`. These origins
+are trusted operator configuration; avoid broad exposure to unrelated services.
+No private deployment address is hardcoded. Public downloads validate DNS results
+and dial the checked IPs, reject local/private/reserved destinations, disable
+proxies and credentials, and allow at most two redirects within the same origin.
+Image data remains subject to byte, pixel, header and time limits.
+
+A typical exchange is an image URL followed by `Kat: what does this error mean?`,
+or an IRC reply to the image message starting with `Kat:` / `@Kat`. No changes to
+Ergo multiline, Kubernetes Secrets, PVC layout or the Helm chart are required.
+
 ## Automatic IRCv3 multiline
 
 By default, kat-irc requests `draft/multiline` alongside `batch` and

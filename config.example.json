@@ -55,6 +55,14 @@
       "max_bytes": 65536,
       "batch_messages": 40,
       "interval_seconds": 300
+    },
+    "vision": {
+      "enabled": false,
+      "max_images": 2,
+      "recent_messages": 8,
+      "max_image_bytes": 8388608,
+      "timeout_seconds": 10,
+      "allow_private_origins": []
     }
   }
 }

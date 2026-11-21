@@ -70,6 +70,7 @@ type Config struct {
 			MaxPerReply    int    `json:"max_per_reply"`
 			TimeoutSeconds int    `json:"timeout_seconds"`
 		} `json:"images"`
+		Vision        VisionConfig        `json:"vision"`
 		Redaction     bool                `json:"redaction"`
 		ChannelMemory ChannelMemoryConfig `json:"channel_memory"`
 	} `json:"bot"`
@@ -144,6 +145,9 @@ func loadConfig(path string) (Config, error) {
 		if c.Bot.ChannelMemory.MaxBytes < 1024+len(c.IRC.Channels)*2048 {
 			return c, fmt.Errorf("channel_memory.max_bytes is too small for the configured channels")
 		}
+	}
+	if err := c.Bot.Vision.defaults(); err != nil {
+		return c, err
 	}
 	// Relative file paths are always relative to the configuration file.
 	for _, p := range []*string{&c.OpenAI.CredentialsFile, &c.IRC.CAFile, &c.Bot.PersonaFile, &c.Bot.MemoryFile, &c.Bot.HistoryFile, &c.Bot.ChannelMemory.File} {

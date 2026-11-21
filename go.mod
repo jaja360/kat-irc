@@ -5,6 +5,7 @@ go 1.26.1
 require (
 	github.com/coreos/go-oidc/v3 v3.14.1
 	github.com/lrstanley/girc v1.1.1
+	golang.org/x/image v0.36.0
 )
 
 require (

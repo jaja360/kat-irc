@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -43,8 +44,9 @@ func atomicJSONLimit(path string, v any, maxBytes int) error {
 }
 
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Images  []ImageDescription `json:"images,omitempty"`
+	Role    string             `json:"role"`
+	Content string             `json:"content"`
 	// MsgID is the IRCv3 msgid of the message, when the server provides one.
 	// It lets the model target a specific (possibly older) message to react to.
 	MsgID string `json:"msgid,omitempty"`
@@ -116,4 +118,30 @@ func (h *History) save() error {
 		return nil
 	}
 	return atomicJSON(h.path, h.channels)
+}
+
+// describeImage replaces message values rather than mutating shared slices:
+// concurrent request snapshots remain immutable. No binary data is persisted.
+func (h *History) describeImage(ch, raw, description string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i := len(h.channels[ch]) - 1; i >= 0; i-- {
+		m := h.channels[ch][i]
+		if m.Role != "user" || !strings.Contains(m.Content, raw) {
+			continue
+		}
+		for _, d := range m.Images {
+			if d.URL == raw {
+				return false
+			}
+		}
+		m.Images = append(append([]ImageDescription(nil), m.Images...), ImageDescription{URL: raw, Description: description})
+		// At most four descriptions can be attached to any retained message.
+		if len(m.Images) > 4 {
+			m.Images = m.Images[len(m.Images)-4:]
+		}
+		h.channels[ch][i] = m
+		return true
+	}
+	return false
 }

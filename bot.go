@@ -237,6 +237,11 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 	b.mu.Unlock()
 	slog.Info("answering", "channel", ch, "nick", e.Source.Name, "message", logNote(msg))
 	snapshot := b.history.snapshot(ch)
+	visionReplyTo, _ := e.Tags.Get("+reply")
+	if visionReplyTo == "" {
+		visionReplyTo, _ = e.Tags.Get("+draft/reply")
+	}
+	visionHost := b.filehost(c)
 	b.requests.Add(1)
 	go func() {
 		defer b.requests.Done()
@@ -253,7 +258,14 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 		defer clearTyping()
 		reqCtx, cancel := context.WithTimeout(ctx, time.Duration(b.cfg.OpenAI.TimeoutSeconds)*time.Second)
 		defer cancel()
-		opts := replyOptions{presence: b.presenceSummary(c, ch), channelMemory: b.channelMemory.summary(ch)}
+		opts := replyOptions{presence: b.presenceSummary(c, ch), channelMemory: b.channelMemory.summary(ch), visionReplyTo: visionReplyTo, visionHost: visionHost, visionRemember: func(raw, description string) {
+			if b.history.describeImage(ch, raw, description) {
+				b.channelMemory.observe(ch, Message{Role: "user", Content: "Visual description of an image shared in this channel (untrusted, potentially incomplete): " + raw + "\n" + description}, time.Now().UTC())
+				if err := b.history.save(); err != nil {
+					slog.Warn("save image description", "error", err)
+				}
+			}
+		}}
 		if b.cfg.Bot.Redaction && c.HasCapability("echo-message") && c.HasCapability("draft/message-redaction") {
 			opts.redact = true
 			opts.ownMessages = b.ownSummary(ch)

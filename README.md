@@ -9,7 +9,9 @@ MIT licensed. No personal profile or deployment-specific configuration is bundle
 - Answers channel messages beginning with its nick followed by `:` or `@nick`
   followed by a non-nick character (whitespace or punctuation) or the end of the
   message. With nick `Kat`: `Kat: hello`, `Kat:hello`, `@Kat hello`, `@Kat:` and
-  `@Kat, hi` work. Mid-sentence mentions, DMs and CTCP do not trigger replies.
+  `@Kat, hi` work. Standalone `@Kat` mentions also work mid-sentence,
+  case-insensitively; DMs and CTCP do not trigger replies. Nickname substrings
+  and email/URL fragments are ignored.
 - Negotiates IRCv3 capabilities with girc, including account tags, server time,
   message tags and batches. Supports SASL PLAIN. Ignores playback batches and
   messages timestamped before the current connection.
@@ -19,7 +21,8 @@ MIT licensed. No personal profile or deployment-specific configuration is bundle
   marker is stripped before posting. Otherwise the answer addresses the channel.
   `always` threads every answer to the triggering message; `never` disables
   threading. Clients that render replies (for example goguma) show the question
-  inline. With `bot.typing`, it also sends `+typing=active` while generating and
+  inline. With `bot.typing`, it refreshes `+typing=active` every four seconds
+  throughout image analysis, model inference and image generation, and sends
   `+typing=done` once the answer starts.
 - Keeps a bounded conversation history per channel. Ordinary channel messages
   become context; addressed messages cause conversational inference. Optional
@@ -356,7 +359,14 @@ OAuth/model availability must be verified with your account.
 When someone addresses Kat, image links in that question have first priority,
 then images in its IRC reply target (`+reply`, or legacy `+draft/reply`). With no
 reply target or direct image, Kat considers images from the last 8 history
-entries in that channel, newest first. A reply target must still be retained in
+entries in that channel, newest first. Images in Kat's own answers are included.
+The first comment on a generated image can trigger its visual description; the
+generation prompt is not treated as proof of what the generated pixels contain.
+With vision enabled, `echo-message` is requested even if redaction is disabled,
+and echoed message IDs (including plain-message fragments) are associated with
+the logical answer and persisted for reply-target lookup. This requires server
+echo support; older messages whose IDs were never recorded can still be selected
+by including their image URL in a new question. A reply target must still be retained in
 `history.json`. Plain messages and silent reaction checks do not download or
 analyze images. There are no cross-channel lookups or playback-triggered scans.
 

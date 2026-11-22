@@ -18,22 +18,37 @@ import (
 	"github.com/lrstanley/girc"
 )
 
-// triggered reports whether s addresses the bot: "nick:" at the start, or "@nick"
-// followed by the end of the message or a non-nick character (whitespace or
-// punctuation). @Katastrophe and mid-sentence mentions do not match.
+// triggered accepts a leading "nick:" or a standalone @nick anywhere.
+// Nickname and email/URL boundaries prevent accidental substring triggers.
 func triggered(s, nick string) bool {
 	if len(s) > len(nick) && s[len(nick)] == ':' && strings.EqualFold(s[:len(nick)], nick) {
 		return true
 	}
 	p := "@" + nick
-	if len(s) < len(p) || !strings.EqualFold(s[:len(p)], p) {
-		return false
+	for i, r := range s {
+		if r != '@' || len(s)-i < len(p) || !strings.EqualFold(s[i:i+len(p)], p) {
+			continue
+		}
+		if i > 0 {
+			prev, _ := utf8.DecodeLastRuneInString(s[:i])
+			if isNickRune(prev) || strings.ContainsRune("@./:+%", prev) {
+				continue
+			}
+		}
+		tokenStart := strings.LastIndexFunc(s[:i], unicode.IsSpace) + 1
+		if strings.Contains(s[tokenStart:i], "://") {
+			continue
+		}
+		end := i + len(p)
+		if end == len(s) {
+			return true
+		}
+		next, _ := utf8.DecodeRuneInString(s[end:])
+		if !isNickRune(next) {
+			return true
+		}
 	}
-	if len(s) == len(p) {
-		return true
-	}
-	r, _ := utf8.DecodeRuneInString(s[len(p):])
-	return !isNickRune(r)
+	return false
 }
 
 // isNickRune reports whether r can appear in an IRC nickname.
@@ -207,7 +222,7 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 	if (!assembled && len(msg) > 4096) || len(msg) > maxLogicalBytes {
 		return
 	}
-	// Ordinary conversation is context, but only an explicit prefix causes inference.
+	// Ordinary conversation is context; only an explicit address causes inference.
 	account, _ := e.Tags.Get("account")
 	msgid, _ := e.Tags.Get("msgid")
 	content := fmt.Sprintf("IRC nick=%s account=%s: %s", e.Source.Name, account, logicalText(msg))
@@ -246,15 +261,7 @@ func (b *Bot) accept(ctx context.Context, c *girc.Client, e girc.Event, started 
 	go func() {
 		defer b.requests.Done()
 		defer b.busy.Store(false)
-		b.setTyping(c, ch, "active")
-		typingCleared := false
-		clearTyping := func() {
-			if typingCleared {
-				return
-			}
-			typingCleared = true
-			b.setTyping(c, ch, "done")
-		}
+		clearTyping := typingSession(ctx, 4*time.Second, func(state string) { b.setTyping(c, ch, state) })
 		defer clearTyping()
 		reqCtx, cancel := context.WithTimeout(ctx, time.Duration(b.cfg.OpenAI.TimeoutSeconds)*time.Second)
 		defer cancel()
@@ -358,7 +365,7 @@ func (b *Bot) applyReactions(c *girc.Client, ch string, calls []ToolCall) int {
 		if seen[args.MsgID] {
 			continue
 		}
-		if !b.history.hasMsgID(ch, args.MsgID) {
+		if !b.history.hasUserMsgID(ch, args.MsgID) {
 			slog.Warn("ignoring reaction to unknown msgid", "msgid", args.MsgID)
 			continue
 		}
@@ -686,6 +693,9 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 	if b.cfg.IRC.Multiline != "off" {
 		cfg.SupportedCaps[multilineCap] = nil
 	}
+	if b.cfg.Bot.Redaction || b.cfg.Bot.Vision.Enabled {
+		cfg.SupportedCaps["echo-message"] = nil
+	}
 	if b.cfg.Bot.Redaction {
 		// echo-message is how we learn the msgids of our own messages.
 		cfg.SupportedCaps["echo-message"] = nil
@@ -801,6 +811,13 @@ func (b *Bot) client(ctx context.Context) (*girc.Client, error) {
 	c.Handlers.Add(girc.ALL_EVENTS, func(c *girc.Client, e girc.Event) {
 		deliver := func(event girc.Event, assembled bool) {
 			if event.Source != nil && strings.EqualFold(event.Source.Name, c.GetNick()) {
+				if b.cfg.Bot.Vision.Enabled && event.Source != nil && len(event.Params) == 2 && !oldEvent(event, started) {
+					if ch := b.allowedChannel(event.Params[0]); ch != "" {
+						if id, _ := event.Tags.Get("msgid"); id != "" {
+							b.history.ownEcho(ch, id, logicalText(event.Last()))
+						}
+					}
+				}
 				if b.cfg.Bot.Redaction {
 					id, _ := event.Tags.Get("msgid")
 					if id != "" && len(event.Params) > 0 {

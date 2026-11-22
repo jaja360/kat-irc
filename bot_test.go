@@ -24,12 +24,12 @@ import (
 )
 
 func TestTrigger(t *testing.T) {
-	for _, s := range []string{"Kat: hello", "Kat:hello", "kat: hey", "@Kat hello", "@KAT\tyes", "@Kat", "Kat:", "@Kat: hello", "@Kat, tu", "@Kat! hey", "@Kat?"} {
+	for _, s := range []string{"Kat: hello", "Kat:hello", "kat: hey", "@Kat hello", "@KAT\tyes", "@Kat", "Kat:", "@Kat: hello", "@Kat, tu", "@Kat! hey", "@Kat?", " @Kat hello", "what do you think @kat?", "hey (@KAT), thoughts?", "é @Kat!", "@Katastrophe then @kat yes"} {
 		if !triggered(s, "Kat") {
 			t.Errorf("should trigger: %q", s)
 		}
 	}
-	for _, s := range []string{"hello Kat: hello", " @Kat hello", "@Katastrophe hello", "@Katx hello", "@Kat-1", "Kat hello", "", "Kat"} {
+	for _, s := range []string{"hello Kat: hello", "@Katastrophe hello", "@Katx hello", "@Kat-1", "Kat hello", "", "Kat", "foo@kat", "https://host/@Kat", "see https://host/?to=@Kat", "@@Kat", "hello @Kat_", "hello @Kat-1"} {
 		if triggered(s, "Kat") {
 			t.Errorf("must not trigger: %q", s)
 		}

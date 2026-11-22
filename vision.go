@@ -242,7 +242,7 @@ func (a *AI) visionInput(ctx context.Context, messages []Message, opts replyOpti
 	}
 	descriptions := map[string]string{}
 	for i, m := range messages {
-		if m.Role != "user" {
+		if m.Role != "user" && m.Role != "assistant" {
 			continue
 		}
 		for _, d := range m.Images {
@@ -254,7 +254,7 @@ func (a *AI) visionInput(ctx context.Context, messages []Message, opts replyOpti
 	var indices []int
 	if opts.visionReplyTo != "" {
 		for i, m := range messages {
-			if m.MsgID == opts.visionReplyTo {
+			if m.hasMsgID(opts.visionReplyTo) {
 				indices = append(indices, i)
 			}
 		}
@@ -270,7 +270,7 @@ func (a *AI) visionInput(ctx context.Context, messages []Message, opts replyOpti
 	seen := map[string]bool{}
 	count := 0
 	for _, i := range indices {
-		if messages[i].Role != "user" {
+		if messages[i].Role != "user" && messages[i].Role != "assistant" {
 			continue
 		}
 		for _, raw := range v.candidates(messages[i].Content, opts.visionHost) {
